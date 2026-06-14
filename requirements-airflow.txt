@@ -1,0 +1,6 @@
+# Airflow instala separado por causa dos constraints dele.
+# Ver: https://airflow.apache.org/docs/apache-airflow/stable/installation/
+# instalar com:
+#   pip install "apache-airflow==2.9.3" --constraint \
+#     "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.11.txt"
+apache-airflow==2.9.3

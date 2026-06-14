@@ -1,0 +1,32 @@
+# dados brutos (o dump do SENATRAN tem ~1.2GB descompactado - nunca vai pro git)
+data/raw/
+data/staging/
+*.TXT
+*.txt
+*.zip
+!requirements*.txt
+
+# amostras versionadas ficam em data/samples/ (essas SIM entram)
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.ipynb_checkpoints/
+
+# dbt
+target/
+dbt_packages/
+logs/
+
+# airflow
+airflow.db
+airflow.cfg
+airflow_home/
+standalone_admin_password.txt
+
+# os
+.DS_Store
+Thumbs.db
