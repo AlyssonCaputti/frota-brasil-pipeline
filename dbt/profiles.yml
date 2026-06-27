@@ -1,0 +1,14 @@
+# profile local. em portfolio deixo aqui no repo pra facilitar rodar;
+# num projeto de verdade isso ficaria em ~/.dbt/profiles.yml com env_var.
+frota_brasil:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('PGHOST', 'localhost') }}"
+      port: "{{ env_var('PGPORT', '5432') | int }}"
+      dbname: "{{ env_var('PGDATABASE', 'frota') }}"
+      user: "{{ env_var('PGUSER', 'frota') }}"
+      password: "{{ env_var('PGPASSWORD', 'frota') }}"
+      schema: analytics
+      threads: 4

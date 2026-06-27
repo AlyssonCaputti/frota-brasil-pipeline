@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw
+    description: "Landing das extracoes (SENATRAN + FIPE), tudo como texto."
+    tables:
+      - name: frota_municipio
+        description: "Dump SENATRAN de frota por UF/municipio/marca-modelo/ano."
+      - name: fipe_versoes
+        description: "Catalogo FIPE achatado (marca -> versao)."

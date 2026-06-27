@@ -1,0 +1,32 @@
+name: frota_brasil
+version: 1.0.0
+config-version: 2
+
+profile: frota_brasil
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+
+target-path: target
+clean-targets:
+  - target
+  - dbt_packages
+
+models:
+  frota_brasil:
+    staging:
+      +schema: staging
+      +materialized: view
+    intermediate:
+      +schema: intermediate
+      +materialized: view
+    marts:
+      +schema: marts
+      +materialized: table
+
+seeds:
+  frota_brasil:
+    de_para_marca:
+      +schema: staging

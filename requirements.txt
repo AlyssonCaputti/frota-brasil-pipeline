@@ -2,4 +2,7 @@ requests==2.32.3
 pandas==2.2.2
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
+# trava no dbt-core 1.8 classico. sem o pin do dbt-core, o pip 26+ puxa o
+# dbt "fusion" 2.0-alpha que ainda nao suporta postgres.
+dbt-core==1.8.7
 dbt-postgres==1.8.2
