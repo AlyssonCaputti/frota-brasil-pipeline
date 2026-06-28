@@ -2,6 +2,9 @@ name: frota_brasil
 version: 1.0.0
 config-version: 2
 
+# testado com dbt-core 1.8.x (postgres). o formato dos testes segue o 1.8.
+require-dbt-version: [">=1.8.0", "<1.9.0"]
+
 profile: frota_brasil
 
 model-paths: ["models"]

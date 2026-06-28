@@ -1,0 +1,43 @@
+version: 2
+
+models:
+  - name: mart_frota_municipio
+    description: "Frota de carros por marca/modelo/ano/UF/municipio."
+    columns:
+      - name: marca
+        tests: [not_null]
+      - name: modelo_base
+        tests: [not_null]
+      - name: ano
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1900
+              max_value: 2027
+      - name: qtd_veiculos
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+
+  - name: mart_consolidada
+    description: "Frota nacional x specs FIPE, por marca/modelo/ano."
+    columns:
+      - name: qtd_veiculos
+        tests: [not_null]
+      # combinacao marca+modelo+ano tem que ser unica nesse grao
+      - name: marca
+        tests:
+          - dbt_utils.unique_combination_of_columns:
+              combination_of_columns:
+                - marca
+                - modelo_base
+                - ano
+      - name: potencia_cv_mediana
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 20
+              max_value: 1000
+              config:
+                # potencia so existe quando a FIPE traz "cv"; ignora nulls
+                where: "potencia_cv_mediana is not null"
