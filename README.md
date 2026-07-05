@@ -89,3 +89,8 @@ FIPE — candidates for extending the de-para seed.
   fleet-level aggregation, not for VIN-level precision.
 
 See [docs/sources.md](docs/sources.md) and [docs/decisions.md](docs/decisions.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE). SENATRAN and FIPE data belong to their
+respective sources; this repo only ships a small sample for demonstration.
