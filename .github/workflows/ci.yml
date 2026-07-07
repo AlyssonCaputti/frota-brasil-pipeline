@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  dbt:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: frota
+          POSTGRES_USER: frota
+          POSTGRES_PASSWORD: frota
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U frota"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGDATABASE: frota
+      PGUSER: frota
+      PGPASSWORD: frota
+      DBT_PROFILES_DIR: dbt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # dbt-core 1.8 nao roda no 3.13+, entao trava no 3.11
+          python-version: "3.11"
+
+      - name: install deps
+        run: pip install -r requirements.txt
+
+      - name: dbt deps + parse
+        working-directory: dbt
+        run: |
+          dbt deps
+          dbt parse
+
+      # roda o pipeline completo na amostra e valida com dbt test.
+      # so o schema raw precisa dos loads em python antes do dbt.
+      - name: load sample + build + test
+        env:
+          USE_SAMPLE: "1"
+        run: |
+          python -m pipeline.load_frota
+          python -m pipeline.load_fipe
+          cd dbt
+          dbt seed
+          dbt run
+          dbt test
