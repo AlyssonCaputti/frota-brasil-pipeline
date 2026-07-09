@@ -58,6 +58,14 @@ order by qtd_veiculos desc
 limit 20;
 ```
 
+Or just use the Makefile:
+
+```bash
+make up          # postgres
+make pipeline    # load + dbt run + dbt test, end to end
+make help        # list targets
+```
+
 To run against the **full** dataset instead of the sample: set `USE_SAMPLE=0`
 in `.env` and run `python -m pipeline.download_senatran` first (~128 MB zip,
 ~1.14 GB extracted, ~22M rows).
