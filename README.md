@@ -1,7 +1,7 @@
 # frota-brasil-pipeline
 
 <!-- troca SEU-USUARIO depois de subir pro github -->
-![ci](https://github.com/SEU-USUARIO/frota-brasil-pipeline/actions/workflows/ci.yml/badge.svg)
+![ci](https://github.com/AlyssonCaputti/frota-brasil-pipeline/actions/workflows/ci.yml/badge.svg)
 
 Data pipeline that joins Brazil's registered vehicle fleet (SENATRAN) with
 technical specs from FIPE, to answer, per **brand / model / year**:
