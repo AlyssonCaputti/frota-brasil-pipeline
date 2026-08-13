@@ -17,6 +17,11 @@ from pipeline import config
 
 BATCH = 100_000
 
+# Acima desse percentual de linhas descartadas a carga aborta. Mesma ideia do
+# limite que uso no sap-mysql-etl: descarte pontual acontece, descarte em massa
+# e layout novo na origem se passando por linha ruim.
+LIMITE_DESCARTE_PCT = 0.5
+
 
 def caminho_fonte():
     if config.USE_SAMPLE:
@@ -56,6 +61,8 @@ def main():
     conn = psycopg2.connect(config.pg_dsn())
     conn.autocommit = False
     total = 0
+    descartadas = 0
+    exemplos_descarte = []
     try:
         with conn.cursor() as cur:
             aplicar_ddl(cur)
@@ -63,9 +70,17 @@ def main():
                 reader = csv.reader(f, delimiter=";")
                 next(reader)  # header
                 buffer = []
-                for row in reader:
+                for n_linha, row in enumerate(reader, start=2):
                     if len(row) != 5:
-                        # linha torta - loga e segue (acontece pouco mas acontece)
+                        # Linha torta. Antes isso era um `continue` calado: em 22M
+                        # linhas, uma mudanca de layout descartava centenas de
+                        # milhares e o processo ainda imprimia "ok". Agora conto,
+                        # guardo exemplo e aborto se passar do limite.
+                        descartadas += 1
+                        if len(exemplos_descarte) < 5:
+                            exemplos_descarte.append(
+                                f"linha {n_linha}: {len(row)} campo(s) -> {row[:6]}"
+                            )
                         continue
                     uf, mun, mm, ano, qtd = (c.strip() for c in row)
                     buffer.append((uf, mun, mm, ano, qtd, config.SENATRAN_MES))
@@ -77,8 +92,29 @@ def main():
                 if buffer:
                     copiar_batch(cur, buffer)
                     total += len(buffer)
+
+        lidas = total + descartadas
+        pct = (descartadas / lidas * 100) if lidas else 0.0
+
+        if descartadas:
+            print(f"\n  ATENCAO: {descartadas:,} de {lidas:,} linha(s) "
+                  f"descartada(s) ({pct:.2f}%) por numero de campos != 5")
+            for ex in exemplos_descarte:
+                print(f"    {ex}")
+
+        # Piso de 0.5%: acima disso nao e sujeira pontual da origem, e mudanca
+        # de layout. Melhor abortar e ficar com o dado do mes passado do que
+        # subir uma tabela com buraco que ninguem vai notar.
+        if pct > LIMITE_DESCARTE_PCT:
+            raise ValueError(
+                f"descarte de {pct:.2f}% passou do limite de "
+                f"{LIMITE_DESCARTE_PCT}% ({descartadas:,} de {lidas:,} linhas). "
+                f"Abortei: isso tem cara de layout novo na origem, nao de linha ruim."
+            )
+
         conn.commit()
-        print(f"\nok: {total:,} linhas em raw.frota_municipio")
+        print(f"\nok: {total:,} linhas em raw.frota_municipio"
+              + (f" ({descartadas:,} descartada(s))" if descartadas else ""))
     except Exception:
         conn.rollback()
         raise
