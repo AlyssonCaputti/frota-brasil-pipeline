@@ -81,7 +81,7 @@ in `.env` and run `python -m pipeline.download_senatran` first (~128 MB zip,
 | Wheel / tyre coverage | 81.9% (optional enrichment step) |
 
 The ~6.9% coverage gap is brands/models whose SENATRAN spelling didn't match
-FIPE — candidates for extending the de-para seed.
+FIPE, candidates for extending the de-para seed.
 
 > On the small committed sample the car share looks lower (~30%) because a
 > single sampled row weighs the same whether it's a mass-market car or a
@@ -89,12 +89,12 @@ FIPE — candidates for extending the de-para seed.
 
 ## Known limitations
 
-- **Power at 48%** — FIPE only exposes power inside the free-text version name,
+- **Power at 48%.** FIPE only exposes power inside the free-text version name,
   and only for some versions. A better source would be needed to close this.
-- **Wheel/tyre is partial and not in the core dbt flow** — the only free source
+- **Wheel/tyre is partial and not in the core dbt flow.** The only free source
   has anti-bot and doesn't catalog pre-1990 classics (Fusca, Kombi, Opala...).
   Kept as an optional step, not a hard dependency of the marts.
-- **`model_base` is a heuristic** — first canonical token of the model name.
+- **`model_base` is a heuristic.** First canonical token of the model name.
   It works for the vast majority but merges some distinct trims; good enough for
   fleet-level aggregation, not for VIN-level precision.
 
@@ -102,5 +102,5 @@ See [docs/sources.md](docs/sources.md) and [docs/decisions.md](docs/decisions.md
 
 ## License
 
-MIT — see [LICENSE](LICENSE). SENATRAN and FIPE data belong to their
+MIT, see [LICENSE](LICENSE). SENATRAN and FIPE data belong to their
 respective sources; this repo only ships a small sample for demonstration.
