@@ -4,6 +4,7 @@ contagem de linhas e amostra. Roda contra a amostra por padrao.
 Foi o primeiro script que escrevi olhando o arquivo - deixei aqui porque
 serve de sanity-check antes de carregar (dump muda de layout de vez em quando).
 """
+import argparse
 import csv
 import sys
 from collections import Counter
@@ -11,16 +12,12 @@ from collections import Counter
 from pipeline import config
 
 
-def caminho_fonte():
-    if config.USE_SAMPLE:
-        return config.SAMPLES_DIR / "senatran_frota_sample.csv"
-    return config.RAW_DIR / (
-        f"i_frota_por_uf_municipio_marca_e_modelo_ano_{config.SENATRAN_MES}.TXT"
-    )
-
-
 def main():
-    fonte = caminho_fonte()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mes", default=config.SENATRAN_MES)
+    args = ap.parse_args()
+
+    fonte = config.caminho_frota(args.mes)
     if not fonte.exists():
         raise SystemExit(f"fonte nao encontrada: {fonte}")
 
