@@ -21,11 +21,12 @@ models:
               min_value: 1
 
   - name: mart_consolidada
-    description: "Frota nacional x specs FIPE, por marca/modelo/ano."
+    description: "Frota nacional x specs FIPE, por marca/modelo/ano/mes."
     columns:
       - name: qtd_veiculos
         tests: [not_null]
-      # combinacao marca+modelo+ano tem que ser unica nesse grao
+      # mes_referencia entra no grao: a mesma marca+modelo+ano repete uma
+      # vez por mes carregado, entao sem ele o teste quebra no 2o mes
       - name: marca
         tests:
           - dbt_utils.unique_combination_of_columns:
@@ -33,6 +34,7 @@ models:
                 - marca
                 - modelo_base
                 - ano
+                - mes_referencia
       - name: potencia_cv_mediana
         tests:
           - dbt_utils.accepted_range:
