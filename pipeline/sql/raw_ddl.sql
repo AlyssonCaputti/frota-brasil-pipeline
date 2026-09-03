@@ -3,8 +3,10 @@ create schema if not exists raw;
 
 -- frota SENATRAN: carrega tudo como texto de proposito. limpeza/cast
 -- fica pro dbt (staging), aqui a gente so pousa o dado do jeito que veio.
-drop table if exists raw.frota_municipio;
-create table raw.frota_municipio (
+-- nao dropa mais: cada mes e uma particao logica por mes_referencia e o
+-- load apaga so o mes que esta entrando, senao carregar o ano inteiro
+-- deixaria sobrar apenas o ultimo mes.
+create table if not exists raw.frota_municipio (
     uf              text,
     municipio       text,
     marca_modelo    text,
@@ -13,8 +15,7 @@ create table raw.frota_municipio (
     mes_referencia  text
 );
 
-drop table if exists raw.fipe_versoes;
-create table raw.fipe_versoes (
+create table if not exists raw.fipe_versoes (
     marca_codigo   text,
     marca_nome     text,
     modelo_codigo  text,
