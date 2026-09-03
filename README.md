@@ -69,6 +69,17 @@ To run against the **full** dataset instead of the sample: set `USE_SAMPLE=0`
 in `.env` and run `python -m pipeline.download_senatran` first (~128 MB zip,
 ~1.14 GB extracted, ~22M rows).
 
+Each month is a logical partition keyed by `mes_referencia`, and a load only
+replaces the month it is loading — so months accumulate and reloading one is
+idempotent. To pull a whole year (2026 currently publishes January–July,
+~940 MB zipped / ~8 GB extracted / ~157M rows):
+
+```bash
+python -m pipeline.download_senatran --ano 2026   # every month published
+python -m pipeline.load_frota --ano 2026          # every month downloaded
+# or: make year ANO=2026
+```
+
 ## Results (full April/2026 dataset)
 
 | Metric | Value |

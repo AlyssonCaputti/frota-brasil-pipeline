@@ -34,7 +34,10 @@ cars (Honda CG stays out, Honda Civic stays in).
 
 ## Tests
 
-- Schema tests on the marts (`not_null`, unique combination, ranges).
+- Schema tests on the marts (`not_null`, unique combination, ranges). The unique
+  combination includes `mes_referencia`, since the same brand/model/year repeats
+  once per loaded month.
 - `tests/assert_cobertura_specs.sql`: a business check that fails if the
   fleet-weighted fuel coverage in `mart_consolidada` drops below 70% — an early
-  warning that the de-para or `model_base` stopped matching FIPE.
+  warning that the de-para or `model_base` stopped matching FIPE. Evaluated per
+  `mes_referencia`, so one bad month can't hide behind a good year.

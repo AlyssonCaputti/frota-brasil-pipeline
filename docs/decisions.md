@@ -26,6 +26,24 @@ brands that also make cars (Honda CG/BIZ vs Honda Civic).
 Decision: ship what the free sources give, be explicit about the gap in the
 docs, don't fake it.
 
+## One month per load, or a whole year
+
+`raw.frota_municipio` used to be dropped and recreated on every load, so the
+table only ever held the month in `SENATRAN_MES`. The marts already carried
+`mes_referencia` all the way through the lineage, so the only thing missing was
+the load step: it now deletes just the month being loaded and appends it. That
+makes reloading a month idempotent and lets `--ano 2026` keep 7 months side by
+side. The monthly Airflow DAG stops wiping history as a side effect.
+
+The coverage test groups by `mes_referencia` for the same reason — averaged over
+a year, one broken month would hide behind the good ones.
+
+Trade-off I'm accepting for now: the marts are still `materialized='table'`, so
+a full year rebuilds ~157M rows on every `dbt run`. Making them incremental on
+`mes_referencia` is the obvious next step, not done yet. Also skipped an index
+on `mes_referencia`: it's a 7-value column and the index would cost more during
+`COPY` than it saves on the once-per-month `delete`.
+
 ## Why dbt for the transforms
 
 The normalization rules (brand de-para, model_base extraction, year validation)
