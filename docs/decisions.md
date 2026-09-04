@@ -38,11 +38,59 @@ side. The monthly Airflow DAG stops wiping history as a side effect.
 The coverage test groups by `mes_referencia` for the same reason — averaged over
 a year, one broken month would hide behind the good ones.
 
-Trade-off I'm accepting for now: the marts are still `materialized='table'`, so
-a full year rebuilds ~157M rows on every `dbt run`. Making them incremental on
-`mes_referencia` is the obvious next step, not done yet. Also skipped an index
-on `mes_referencia`: it's a 7-value column and the index would cost more during
-`COPY` than it saves on the once-per-month `delete`.
+Skipped an index on `mes_referencia`: it's a low-cardinality column and the
+index would cost more during `COPY` than it saves on the once-per-month
+`delete`.
+
+## Incremental marts, partitioned by month
+
+The marts used to be `materialized='table'`, so a full year rebuilt ~157M rows
+on every `dbt run` just to add one month. Three years would be ~700M. Both
+marts are now `materialized='incremental'` with `incremental_strategy='delete+insert'`
+and `unique_key='mes_referencia'`.
+
+The unique key is the **month**, not the grain (`marca+modelo_base+ano+...`).
+That's deliberate: the logical partition is the whole month, which is the same
+contract `load_frota.py` already honors when it deletes only the month being
+loaded. Reloading a month stays idempotent end to end.
+
+The month filter lives in one macro (`filtro_meses`) so both marts pick the
+same months. `mart_consolidada` compares against **itself** rather than its
+source — comparing against the source would permanently skip a month that had
+landed in `mart_frota_municipio` but not yet in the consolidated table.
+
+Two consequences worth knowing:
+
+- FIPE specs carry no month (the catalog is always "now"), so a month already
+  materialized keeps the specs that were valid when it landed. Use
+  `dbt run --full-refresh` to re-spec history against a fresh catalog.
+- To reprocess one corrected month without touching the rest:
+  `dbt run --vars '{meses: ["maio_2026"]}'`.
+
+## Parquet as the cold copy of raw
+
+One month of the dump is ~1.1 GB of TXT and ~22M rows; three years would be
+~35 GB of text sitting on disk. `pipeline/to_parquet.py` converts each month to
+Parquet (zstd + dictionary encoding), written in row groups so peak memory
+stays flat regardless of file size.
+
+Measured on the committed 75k-row sample: **7.0x smaller** (3.98 MB → 0.57 MB).
+The full dump should do better, since `municipio` and `marca_modelo` repeat far
+more across 22M rows than across 75k.
+
+Everything stays string-typed, exactly like `raw_ddl.sql` — casting here would
+mean deciding the schema before looking at the data, which is precisely what
+landing raw as text already avoids.
+
+`load_frota.py` prefers the Parquet when it exists and falls back to the TXT
+otherwise, so nobody who already has TXT files on disk has to convert. Parquet
+is a *cold copy*, not a replacement for Postgres: it exists so a month can be
+reprocessed without re-downloading 130 MB.
+
+Deliberately **not** done: moving the warehouse to DuckDB-over-Parquet. It is
+arguably the right long-term shape for 700M rows, but it swaps the engine
+(`unaccent` doesn't exist in DuckDB, the loads are psycopg2, CI would change)
+and nothing has been measured yet showing Postgres as the bottleneck.
 
 ## Why dbt for the transforms
 

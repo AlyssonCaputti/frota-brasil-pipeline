@@ -13,6 +13,7 @@ Uso:
     python -m pipeline.download_senatran                # baixa o mes do .env
     python -m pipeline.download_senatran --mes maio_2026
     python -m pipeline.download_senatran --ano 2026     # todo mes publicado do ano
+    python -m pipeline.download_senatran --ano 2026 --parquet  # converte e apaga o TXT
 """
 
 import argparse
@@ -23,7 +24,7 @@ import zipfile
 
 import requests
 
-from pipeline import config
+from pipeline import config, to_parquet
 
 # so .zip: os dumps de 2013-2018 vem em .rar, que o zipfile nao abre. o nome
 # do mes vem do proprio padrao pra ja validar e separar mes/ano.
@@ -31,7 +32,9 @@ PADRAO_MES = re.compile(
     r"_municipio_marca_e_modelo_ano_(" + "|".join(config.MESES) + r")_(\d{4})\.zip$"
 )
 
-PAUSA_MESES = 3  # seg entre downloads, pra nao socar o portal no backfill do ano
+# seg entre downloads. 3s era pouco: no backfill de 31 meses o portal comeca
+# a recusar depois de alguns arquivos de ~120 MB seguidos.
+PAUSA_MESES = 20
 
 
 def meses_publicados():
@@ -73,7 +76,7 @@ def _stream(url, destino):
     return destino
 
 
-def baixar(url: str, destino, tentativas=4):
+def baixar(url: str, destino, tentativas=6):
     destino.parent.mkdir(parents=True, exist_ok=True)
     print(f"baixando {url}")
     for i in range(tentativas):
@@ -82,8 +85,14 @@ def baixar(url: str, destino, tentativas=4):
         except requests.RequestException as e:
             # o portal corta a conexao no meio de um arquivo de ~130MB de vez
             # em quando (IncompleteRead). recomeca o arquivo do zero - Range
-            # aqui nao e confiavel - com o mesmo backoff do fipe_client.
-            espera = 2 ** i
+            # aqui nao e confiavel.
+            #
+            # 15s dobrando: com 1/2/4/8s eu desistia de mes que estava no ar,
+            # porque o portal comeca a devolver HTTPError depois de alguns
+            # arquivos grandes seguidos e precisa de mais tempo.
+            if i == tentativas - 1:
+                break
+            espera = 15 * 2 ** i
             print(f"\n  caiu em {type(e).__name__}, tentando de novo em {espera}s")
             time.sleep(espera)
     raise RuntimeError(f"desisti de {url} depois de {tentativas} tentativas")
@@ -97,12 +106,20 @@ def descompactar(zip_path):
     return zip_path.parent / nome_txt
 
 
-def main():
+def main(argv=None):
+    """argv explicito porque o Airflow chama main() direto - sem isso o
+    parse_args pegaria o sys.argv do worker."""
     ap = argparse.ArgumentParser()
     grupo = ap.add_mutually_exclusive_group()
     grupo.add_argument("--mes")
     grupo.add_argument("--ano", help="baixa todo mes publicado do ano")
-    args = ap.parse_args()
+    ap.add_argument(
+        "--parquet",
+        action="store_true",
+        help="converte pra parquet e apaga o TXT (use no backfill de varios "
+        "anos: ~7x menos disco)",
+    )
+    args = ap.parse_args(argv)
 
     if config.USE_SAMPLE:
         print(
@@ -132,6 +149,11 @@ def main():
     baixados = 0
     for mes in meses:
         txt = config.caminho_frota(mes)
+        # parquet conta como baixado: depois de --parquet o TXT nao existe
+        # mais, e olhar so ele baixaria 130 MB de novo pra nada
+        if to_parquet.caminho_parquet(mes).exists():
+            print(f"{mes}: parquet ja existe, pulando")
+            continue
         if txt.exists():
             print(f"{mes}: {txt.name} ja existe, pulando")
             continue
@@ -140,6 +162,10 @@ def main():
         zip_path = config.RAW_DIR / f"frota_municipio_{mes}.zip"
         baixar(publicados[mes], zip_path)
         print(f"pronto: {descompactar(zip_path)}")
+        # o zip nao serve mais - a fonte do load e o TXT (ou o parquet)
+        zip_path.unlink(missing_ok=True)
+        if args.parquet:
+            to_parquet.converter(mes, apagar_txt=True)
         baixados += 1
     return 0
 
