@@ -27,14 +27,17 @@ default_args = {
 }
 
 
+# passo argv sempre: com argv=None o parse_args pegaria o sys.argv do worker.
 def _download(**_):
     from pipeline.download_senatran import main
-    main()
+    # --parquet porque a DAG roda todo mes: sem isso o volume acumula ~8 GB
+    # de TXT por ano.
+    main(["--parquet"])
 
 
 def _load_frota(**_):
     from pipeline.load_frota import main
-    main()
+    main([])
 
 
 def _load_fipe(**_):

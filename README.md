@@ -71,13 +71,44 @@ in `.env` and run `python -m pipeline.download_senatran` first (~128 MB zip,
 
 Each month is a logical partition keyed by `mes_referencia`, and a load only
 replaces the month it is loading — so months accumulate and reloading one is
-idempotent. To pull a whole year (2026 currently publishes January–July,
-~940 MB zipped / ~8 GB extracted / ~157M rows):
+idempotent. The marts are incremental on the same key, so adding a month
+doesn't rebuild the ones already there. To pull a whole year (2026 currently
+publishes January–July, ~940 MB zipped / ~8 GB extracted / ~157M rows):
 
 ```bash
 python -m pipeline.download_senatran --ano 2026   # every month published
 python -m pipeline.load_frota --ano 2026          # every month downloaded
 # or: make year ANO=2026
+```
+
+### Multi-year backfill
+
+For several years, keep the raw months as Parquet instead of TXT — measured
+**7x smaller** on the sample, and better on the full dump, since the dump's
+columns are almost all low-cardinality:
+
+```bash
+make backfill ANOS="2024 2025 2026"     # download → parquet → load, year by year
+make parquet ANO=2026                   # convert TXTs already on disk
+```
+
+`load_frota` reads the Parquet when it's there and the TXT when it isn't, so
+converting is optional. Rough sizing per year of TXT vs. Parquet:
+
+| | Months | TXT on disk | Parquet | Raw rows |
+|---|---|---|---|---|
+| 2026 so far | 7 | ~8 GB | ~1 GB | ~157M |
+| 3 full years | ~31 | ~35 GB | ~5 GB | ~700M |
+
+Two flags worth knowing:
+
+```bash
+# reprocess one corrected month without touching the rest
+cd dbt && dbt run --vars '{meses: ["maio_2026"]}'
+
+# FIPE specs have no month, so a materialized month keeps the specs it
+# landed with; re-spec all history against a fresh catalog:
+cd dbt && dbt run --full-refresh
 ```
 
 ## Results (full April/2026 dataset)

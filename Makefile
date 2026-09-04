@@ -1,9 +1,11 @@
 # atalhos do dia a dia. `make help` lista tudo.
-.PHONY: help up down load year dbt test pipeline clean
+.PHONY: help up down load year backfill parquet dbt test pipeline clean
 
 DBT_DIR := dbt
 export DBT_PROFILES_DIR := $(DBT_DIR)
 ANO ?= 2026
+# ex: make backfill ANOS="2024 2025"
+ANOS ?= 2024 2025 2026
 
 help:  ## lista os targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -23,6 +25,17 @@ year:  ## baixa e carrega o ano inteiro (ex: make year ANO=2026, precisa USE_SAM
 	python -m pipeline.download_senatran --ano $(ANO)
 	python -m pipeline.load_frota --ano $(ANO)
 	python -m pipeline.load_fipe
+
+backfill:  ## baixa+carrega varios anos em parquet (ex: make backfill ANOS="2024 2025 2026")
+	@for ano in $(ANOS); do \
+		echo "=== $$ano ==="; \
+		python -m pipeline.download_senatran --ano $$ano --parquet || exit 1; \
+		python -m pipeline.load_frota --ano $$ano || exit 1; \
+	done
+	python -m pipeline.load_fipe
+
+parquet:  ## converte os TXT ja baixados de um ano em parquet (ex: make parquet ANO=2026)
+	python -m pipeline.to_parquet --ano $(ANO) --apagar-txt
 
 dbt:  ## dbt deps + seed + run
 	cd $(DBT_DIR) && dbt deps && dbt seed && dbt run

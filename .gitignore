@@ -16,6 +16,10 @@ venv/
 .env
 .ipynb_checkpoints/
 
+# rascunhos de exploracao local
+teste.py
+scratch*.py
+
 # dbt
 target/
 dbt_packages/

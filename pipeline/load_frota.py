@@ -1,8 +1,11 @@
-"""Carrega o dump de frota (TXT ou amostra) na tabela raw.frota_municipio.
+"""Carrega o dump de frota (Parquet, TXT ou amostra) na raw.frota_municipio.
 
 Le em streaming e usa COPY do postgres (via copy_expert) por batches -
 o arquivo full tem 22M linhas, nao da pra segurar em memoria nem fazer
 INSERT linha a linha.
+
+Prefiro o Parquet do mes quando existe (ver to_parquet.py) e caio no TXT
+quando nao, pra quem ja baixou os TXT nao ter que converter.
 
 Cada mes e uma particao logica por mes_referencia: o load apaga so o mes
 que esta entrando, entao recarregar um mes e idempotente e os outros meses
@@ -21,7 +24,7 @@ import sys
 
 import psycopg2
 
-from pipeline import config
+from pipeline import config, to_parquet
 
 BATCH = 100_000
 
@@ -52,14 +55,72 @@ def copiar_batch(cur, linhas):
 
 
 def meses_do_ano(ano):
-    """Meses de <ano> com TXT em data/raw, em ordem cronologica."""
+    """Meses de <ano> com Parquet ou TXT em data/raw, em ordem cronologica.
+
+    Olho os dois: depois de --apagar-txt o mes existe so em Parquet, e checar
+    apenas o TXT o deixaria fora do --ano sem reclamar.
+    """
     meses = [f"{m}_{ano}" for m in config.MESES]
-    return [m for m in meses if config.caminho_frota(m).exists()]
+    return [
+        m
+        for m in meses
+        if config.caminho_frota(m).exists() or to_parquet.caminho_parquet(m).exists()
+    ]
+
+
+def _ler_txt(fonte, mes, descarte):
+    """Gera as tuplas do TXT do SENATRAN.
+
+    `descarte` e dict de saida (gerador nao tem return): preencho aqui, o
+    chamador le depois. Nao rendo junto das tuplas porque num arquivo 100%
+    torto nada seria rendido e o descarte se perderia num "ok: 0 linhas".
+    """
+    with open(fonte, encoding="utf-8-sig") as f:
+        reader = csv.reader(f, delimiter=";")
+        next(reader)  # header
+        for n_linha, row in enumerate(reader, start=2):
+            if len(row) != 5:
+                # Linha torta. Antes isso era um `continue` calado: em 22M
+                # linhas, uma mudanca de layout descartava centenas de
+                # milhares e o processo ainda imprimia "ok". Agora conto,
+                # guardo exemplo e aborto se passar do limite.
+                descarte["n"] += 1
+                if len(descarte["exemplos"]) < 5:
+                    descarte["exemplos"].append(
+                        f"linha {n_linha}: {len(row)} campo(s) -> {row[:6]}"
+                    )
+                continue
+            uf, mun, mm, ano, qtd = (c.strip() for c in row)
+            yield (uf, mun, mm, ano, qtd, mes)
+
+
+def _ler_parquet(fonte, mes, descarte):
+    """Gera as tuplas do Parquet, por row group.
+
+    Nao toco em `descarte`: o to_parquet ja contou as linhas tortas e o
+    schema garante as 5 colunas.
+    """
+    import pyarrow.parquet as pq
+
+    arquivo = pq.ParquetFile(fonte)
+    for lote in arquivo.iter_batches(batch_size=BATCH, columns=to_parquet.COLUNAS):
+        colunas = [lote.column(c).to_pylist() for c in to_parquet.COLUNAS]
+        for uf, mun, mm, ano, qtd in zip(*colunas):
+            yield (uf, mun, mm, ano, qtd, mes)
+
+
+def _escolher_fonte(mes):
+    """(caminho, leitor) do mes: Parquet se existir, senao o TXT."""
+    parquet = to_parquet.caminho_parquet(mes)
+    # com USE_SAMPLE nem olho: a amostra e CSV e nunca gera parquet
+    if not config.USE_SAMPLE and parquet.exists():
+        return parquet, _ler_parquet
+    return config.caminho_frota(mes), _ler_txt
 
 
 def carregar_mes(cur, mes):
     """Carrega um mes e devolve (linhas carregadas, linhas descartadas)."""
-    fonte = config.caminho_frota(mes)
+    fonte, leitor = _escolher_fonte(mes)
     if not fonte.exists():
         raise SystemExit(
             f"fonte nao encontrada: {fonte} (rodou o download? ou seta USE_SAMPLE=1)"
@@ -69,35 +130,21 @@ def carregar_mes(cur, mes):
     cur.execute("delete from raw.frota_municipio where mes_referencia = %s", (mes,))
 
     total = 0
-    descartadas = 0
-    exemplos_descarte = []
-    with open(fonte, encoding="utf-8-sig") as f:
-        reader = csv.reader(f, delimiter=";")
-        next(reader)  # header
-        buffer = []
-        for n_linha, row in enumerate(reader, start=2):
-            if len(row) != 5:
-                # Linha torta. Antes isso era um `continue` calado: em 22M
-                # linhas, uma mudanca de layout descartava centenas de
-                # milhares e o processo ainda imprimia "ok". Agora conto,
-                # guardo exemplo e aborto se passar do limite.
-                descartadas += 1
-                if len(exemplos_descarte) < 5:
-                    exemplos_descarte.append(
-                        f"linha {n_linha}: {len(row)} campo(s) -> {row[:6]}"
-                    )
-                continue
-            uf, mun, mm, ano, qtd = (c.strip() for c in row)
-            buffer.append((uf, mun, mm, ano, qtd, mes))
-            if len(buffer) >= BATCH:
-                copiar_batch(cur, buffer)
-                total += len(buffer)
-                print(f"\r  {total:,} linhas", end="", flush=True)
-                buffer = []
-        if buffer:
+    descarte = {"n": 0, "exemplos": []}
+    buffer = []
+    for tupla in leitor(fonte, mes, descarte):
+        buffer.append(tupla)
+        if len(buffer) >= BATCH:
             copiar_batch(cur, buffer)
             total += len(buffer)
+            print(f"\r  {total:,} linhas", end="", flush=True)
+            buffer = []
+    if buffer:
+        copiar_batch(cur, buffer)
+        total += len(buffer)
 
+    descartadas = descarte["n"]
+    exemplos_descarte = descarte["exemplos"]
     lidas = total + descartadas
     pct = (descartadas / lidas * 100) if lidas else 0.0
 
@@ -123,12 +170,13 @@ def carregar_mes(cur, mes):
     return total, descartadas
 
 
-def main():
+def main(argv=None):
+    """argv explicito por causa do Airflow (ver download_senatran)."""
     ap = argparse.ArgumentParser()
     grupo = ap.add_mutually_exclusive_group()
     grupo.add_argument("--mes", action="append", help="pode repetir")
     grupo.add_argument("--ano", help="carrega todo mes do ano ja baixado")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.ano:
         if config.USE_SAMPLE:
