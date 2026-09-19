@@ -1,0 +1,4 @@
+# Alvo BigQuery (dbt --target bq). Fora do requirements.txt de proposito:
+# o CI e o caminho padrao rodam em Postgres e nao precisam baixar isso.
+dbt-bigquery==1.8.2
+google-cloud-storage==2.18.2

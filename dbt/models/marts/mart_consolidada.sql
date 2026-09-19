@@ -2,7 +2,14 @@
   config(
     materialized='incremental',
     unique_key='mes_referencia',
-    incremental_strategy='delete+insert',
+    incremental_strategy=(
+      'insert_overwrite' if target.type == 'bigquery' else 'delete+insert'
+    ),
+    partition_by=(
+      {'field': 'mes_data', 'data_type': 'date', 'granularity': 'month'}
+      if target.type == 'bigquery' else none
+    ),
+    cluster_by=(['marca', 'modelo_base'] if target.type == 'bigquery' else none),
   )
 }}
 
@@ -39,7 +46,8 @@ select
     s.motores,
     s.combustiveis,
     s.potencia_cv_mediana,
-    f.mes_referencia
+    f.mes_referencia,
+    {{ mes_para_data('f.mes_referencia') }} as mes_data
 from frota_nacional f
 left join {{ ref('int_fipe_specs') }} s
     on f.marca = s.marca

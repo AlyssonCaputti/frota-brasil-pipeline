@@ -28,6 +28,7 @@ FIPE API ──────────────┘                   └─>
 | Transform | dbt (postgres) | `staging -> intermediate -> marts`, normalization as macros, brand de-para as a seed |
 | Tests | dbt tests | `not_null` / `unique` / `accepted_range` + a custom fleet-weighted coverage test |
 | Orchestration | Airflow | Monthly DAG: download -> load -> dbt run -> dbt test |
+| Warehouse migration | BigQuery | Target, partition/cluster configs and sizing — **designed, not deployed** ([docs/bigquery.md](docs/bigquery.md)) |
 
 ## Quickstart (sample data, no 1.2 GB download)
 
@@ -144,6 +145,20 @@ FIPE, candidates for extending the de-para seed.
 - **`model_base` is a heuristic.** First canonical token of the model name.
   It works for the vast majority but merges some distinct trims; good enough for
   fleet-level aggregation, not for VIN-level precision.
+
+## BigQuery: sized before it's built
+
+The marts already carry `partition_by` (monthly, on a derived `mes_data`) and
+`cluster_by` (`marca`, `modelo_base`), applied only when `target.type` is
+`bigquery` so the Postgres path is untouched. `dbt run --target bq` is wired.
+
+**It has never run against BigQuery** — there is no GCP project here. What the
+repo does contain is the measurement that justifies those keys, recomputed from
+the real dump by `python -m pipeline.dimensiona_bq`: a month-filtered query
+reads 97% fewer bytes, clustering cuts the worst brand query from 20.3 GB to
+3.0 GB, and behind a dashboard at 1,000 queries/day that is US$ 96/month
+instead of US$ 3,457/month. Full reasoning and caveats in
+[docs/bigquery.md](docs/bigquery.md).
 
 See [docs/sources.md](docs/sources.md) and [docs/decisions.md](docs/decisions.md).
 

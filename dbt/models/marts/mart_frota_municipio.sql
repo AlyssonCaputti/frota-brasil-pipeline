@@ -2,7 +2,14 @@
   config(
     materialized='incremental',
     unique_key='mes_referencia',
-    incremental_strategy='delete+insert',
+    incremental_strategy=(
+      'insert_overwrite' if target.type == 'bigquery' else 'delete+insert'
+    ),
+    partition_by=(
+      {'field': 'mes_data', 'data_type': 'date', 'granularity': 'month'}
+      if target.type == 'bigquery' else none
+    ),
+    cluster_by=(['marca', 'modelo_base'] if target.type == 'bigquery' else none),
   )
 }}
 
@@ -19,8 +26,9 @@ select
     uf,
     municipio,
     sum(qtd_veiculos) as qtd_veiculos,
-    mes_referencia
+    mes_referencia,
+    {{ mes_para_data('mes_referencia') }} as mes_data
 from {{ ref('int_frota_carros') }}
 where 1 = 1
     {{ filtro_meses() }}
-group by 1, 2, 3, 4, 5, 7
+group by 1, 2, 3, 4, 5, 7, 8

@@ -12,3 +12,19 @@ frota_brasil:
       password: "{{ env_var('PGPASSWORD', 'frota') }}"
       schema: analytics
       threads: 4
+
+    # Alvo da migracao pro BigQuery. Os models ja saem particionados por mes e
+    # clusterizados por marca/modelo_base quando target.type == 'bigquery' -
+    # ver o config no topo das duas marts e docs/bigquery.md pro porque.
+    #
+    # NAO esta em producao: nao ha projeto GCP neste repo. Roda com
+    #   dbt run --target bq
+    # depois de `gcloud auth application-default login` e de setar GCP_PROJECT.
+    bq:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('GCP_PROJECT', 'frota-brasil') }}"
+      dataset: "{{ env_var('BQ_DATASET', 'analytics') }}"
+      location: "{{ env_var('BQ_LOCATION', 'southamerica-east1') }}"
+      threads: 8
+      priority: interactive
