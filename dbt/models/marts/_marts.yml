@@ -19,6 +19,11 @@ models:
           - not_null
           - dbt_utils.accepted_range:
               min_value: 1
+      # derivada de mes_referencia: e a chave de particao no BigQuery, que
+      # nao particiona por string. not_null pega mes com nome fora do padrao,
+      # que viraria null no case da macro e cairia numa particao sem data.
+      - name: mes_data
+        tests: [not_null]
 
   - name: mart_consolidada
     description: "Frota nacional x specs FIPE, por marca/modelo/ano/mes."
@@ -35,6 +40,8 @@ models:
             - mes_referencia
     columns:
       - name: qtd_veiculos
+        tests: [not_null]
+      - name: mes_data
         tests: [not_null]
       - name: potencia_cv_mediana
         tests:
