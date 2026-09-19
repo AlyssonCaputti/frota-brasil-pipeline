@@ -53,12 +53,19 @@ def meses_publicados():
     return {mes: url for _, mes, url in sorted(achados)}
 
 
-def _stream(url, destino):
-    with requests.get(url, stream=True, timeout=600) as r:
+def _stream(url, destino, ja_baixado=0):
+    cabecalhos = {"Range": f"bytes={ja_baixado}-"} if ja_baixado else {}
+    with requests.get(url, stream=True, timeout=600, headers=cabecalhos) as r:
         r.raise_for_status()
+        # 206 = aceitou o Range. se vier 200 o servidor ignorou e mandou o
+        # arquivo inteiro, entao escreve do zero em vez de concatenar.
+        retomando = r.status_code == 206
         total = int(r.headers.get("content-length", 0))
         baixado = 0
-        with open(destino, "wb") as f:
+        if retomando:
+            total += ja_baixado
+            baixado = ja_baixado
+        with open(destino, "ab" if retomando else "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
                 f.write(chunk)
                 baixado += len(chunk)
@@ -73,28 +80,41 @@ def _stream(url, destino):
     return destino
 
 
-def baixar(url: str, destino, tentativas=4):
+def baixar(url: str, destino, tentativas=6):
     destino.parent.mkdir(parents=True, exist_ok=True)
     print(f"baixando {url}")
     for i in range(tentativas):
+        # 1a tentativa sempre do zero: parcial de uma execucao antiga pode ser
+        # de outra versao do arquivo. da 2a em diante retoma de onde parou,
+        # senao arquivo grande em conexao ruim nunca fecha (o de 265MB de 2019
+        # estourou 4 tentativas reiniciando do inicio toda vez).
+        ja_baixado = destino.stat().st_size if i and destino.exists() else 0
         try:
-            return _stream(url, destino)
+            return _stream(url, destino, ja_baixado)
         except requests.RequestException as e:
-            # o portal corta a conexao no meio de um arquivo de ~130MB de vez
-            # em quando (IncompleteRead). recomeca o arquivo do zero - Range
-            # aqui nao e confiavel - com o mesmo backoff do fipe_client.
             espera = 2 ** i
-            print(f"\n  caiu em {type(e).__name__}, tentando de novo em {espera}s")
+            print(
+                f"\n  caiu em {type(e).__name__} com {destino.stat().st_size / 1e6:.0f}"
+                f" MB, retomando em {espera}s"
+            )
             time.sleep(espera)
     raise RuntimeError(f"desisti de {url} depois de {tentativas} tentativas")
 
 
 def descompactar(zip_path):
     with zipfile.ZipFile(zip_path) as z:
-        # o zip tem um unico TXT dentro
-        nome_txt = z.namelist()[0]
-        z.extractall(zip_path.parent)
-    return zip_path.parent / nome_txt
+        # de 2020 em diante o zip traz um TXT; ate 2019 vinha um banco Access
+        # (.accdb, .mdb) que o resto do pipeline nao le. melhor dizer isso
+        # aqui do que deixar o load reclamar de "fonte nao encontrada".
+        txts = [n for n in z.namelist() if n.lower().endswith(".txt")]
+        if not txts:
+            raise SystemExit(
+                f"{zip_path.name} nao tem TXT dentro: {z.namelist()}. "
+                "dumps anteriores a 2020 vem em Access (.mdb/.accdb), "
+                "formato que este pipeline nao le."
+            )
+        z.extract(txts[0], zip_path.parent)
+    return zip_path.parent / txts[0]
 
 
 def main():
@@ -102,6 +122,7 @@ def main():
     grupo = ap.add_mutually_exclusive_group()
     grupo.add_argument("--mes")
     grupo.add_argument("--ano", help="baixa todo mes publicado do ano")
+    grupo.add_argument("--desde", help="baixa do ano informado pra frente")
     args = ap.parse_args()
 
     if config.USE_SAMPLE:
@@ -112,11 +133,17 @@ def main():
         return 0
 
     publicados = meses_publicados()
-    if args.ano:
-        meses = [m for m in publicados if m.endswith(f"_{args.ano}")]
+    if args.ano or args.desde:
+        if args.desde:
+            corte = int(args.desde)
+            meses = [m for m in publicados if int(m.rsplit("_", 1)[1]) >= corte]
+            alvo = f"de {args.desde} em diante"
+        else:
+            meses = [m for m in publicados if m.endswith(f"_{args.ano}")]
+            alvo = args.ano
         if not meses:
             raise SystemExit(
-                f"nenhum mes publicado pra {args.ano}.\n"
+                f"nenhum mes publicado pra {alvo}.\n"
                 "meses disponiveis:\n  - " + "\n  - ".join(publicados)
             )
     else:
