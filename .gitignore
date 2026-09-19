@@ -12,6 +12,7 @@ data/staging/
 __pycache__/
 *.py[cod]
 .venv/
+.venv-dbt/
 venv/
 .env
 .ipynb_checkpoints/

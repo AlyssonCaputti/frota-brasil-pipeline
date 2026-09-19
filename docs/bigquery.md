@@ -1,10 +1,33 @@
 # BigQuery: the migration, sized before it's built
 
-**Status: designed and measured, not deployed.** There is no GCP project behind
-this repo. What's here is the dbt target, the model configs, the external-table
-DDL and the sizing that justifies them — enough to run `dbt run --target bq`
-against a project, and enough to argue why the partition and cluster keys are
-what they are. Nothing in this repo has ever executed against BigQuery.
+**Status: designed, measured, and parsed against the real adapter — never
+executed against a project.** There is no GCP account behind this repo. What's
+here is the dbt target, the model configs, the external-table DDL and the sizing
+that justifies them.
+
+The configs are not just *written*, they are **resolved by `dbt-bigquery`
+itself**. `dbt parse --target bq` registers the BigQuery adapter and accepts
+them, and the manifest shows what each target actually gets — same models, same
+code:
+
+```
+$ dbt parse --target bq && <read target/manifest.json>
+target usado: bigquery
+  mart_consolidada       strategy=insert_overwrite  partition={'field': 'mes_data',
+                         'data_type': 'date', 'granularity': 'month'}  cluster=['marca', 'modelo_base']
+  mart_frota_municipio   strategy=insert_overwrite  partition=... (idem)
+
+$ dbt parse            && <read target/manifest.json>
+target usado: postgres
+  mart_consolidada       strategy=delete+insert     partition=None  cluster=None
+  mart_frota_municipio   strategy=delete+insert     partition=None  cluster=None
+```
+
+That is the useful half of the claim: the partitioning and clustering are
+syntactically valid for BigQuery and provably inert on Postgres. What it is
+**not** is proof that a `dbt run --target bq` succeeds, that the partitions
+prune as modelled, or that the bill looks like the estimate below. Those need a
+project and a credit card.
 
 ## Why partition, and why by month
 
