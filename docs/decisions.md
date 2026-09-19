@@ -132,6 +132,33 @@ letting the failure surface as "fonte nao encontrada" several steps later.
 Reading the Access years would need `mdbtools` or `access-parser` — a new
 extractor, not a tweak.
 
+## The Access years (2018–2019): attempted, not shipped
+
+The portal changed container, not content: `.TXT` from 2020, `.accdb` in
+2018–2019, `.mdb` in 2013–2014. An extractor writing a TXT in the modern shape
+would let `to_parquet`, `load_frota` and the whole dbt lineage stay ignorant of
+where the month came from. I tried to build it against January/2019 — a 2.05 GB
+`.accdb` — and stopped. Notes, so the next attempt starts further along:
+
+**`access-parser` (pure Python) is not viable at this file size.** Asking it for
+`Layout I`, a *metadata* table with six columns, consumed **5.8 GB of RAM and
+646 s of CPU without finishing**. It appears to materialize the whole database
+regardless of the table requested, and `parse_table` has no streaming API — it
+returns `{column: [values]}` for everything.
+
+**`pyodbc` with the native ACE driver is the right shape and still blocked.** It
+connects in 7.3 s and reads schema cheaply, so memory and speed stop being the
+problem. What blocks it is the file itself: the data lives in
+`f_D1526399FEE243B19F3FB88B6E1000A0_Data`, a GUID-named object that ODBC does
+not return from `tables()` at all, and follow-up queries hang. Only `Layout I`
+is exposed as a real table. Whatever produced these files didn't lay them out
+like an ordinary Access database.
+
+So the backfill floor stays **2020**, and it isn't a line of code away. The
+honest next step is `mdb-export` from mdbtools on Linux, which reads the file
+format directly rather than through the Access engine — untested here, since
+mdbtools has no Windows build and this machine has no Linux.
+
 ## Why dbt for the transforms
 
 The normalization rules (brand de-para, model_base extraction, year validation)
