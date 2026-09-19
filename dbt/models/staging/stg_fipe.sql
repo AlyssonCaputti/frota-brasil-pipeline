@@ -21,7 +21,13 @@ with fonte as (
 )
 
 select
-    {{ norm_txt('marca_nome') }}                    as marca_fipe,
+    -- a FIPE prefixa duas marcas com a sigla antiga: "GM - Chevrolet" e
+    -- "VW - VolksWagen". O norm_txt troca o hifen por espaco e sobra
+    -- "GM CHEVROLET", que nunca casa com o CHEVROLET que o de-para produz -
+    -- e ai VW e Chevrolet, #1 e #3 da frota, caem inteiras na whitelist.
+    -- Corta o que vem antes de " - "; Mercedes-Benz e Rolls-Royce tem hifen
+    -- colado e nao sao afetadas.
+    {{ norm_txt("split_part(marca_nome, ' - ', -1)") }} as marca_fipe,
     modelo_nome,
     {{ model_base('modelo_nome') }}                 as modelo_base,
     -- cilindrada: primeiro "N.N" do nome
