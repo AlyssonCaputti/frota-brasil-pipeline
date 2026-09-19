@@ -10,6 +10,7 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
+PARQUET_DIR = DATA_DIR / "parquet"
 SAMPLES_DIR = DATA_DIR / "samples"
 
 SENATRAN_MES = os.getenv("SENATRAN_MES", "abril_2026")

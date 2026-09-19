@@ -1,9 +1,11 @@
 # dados brutos (o dump do SENATRAN tem ~1.2GB descompactado - nunca vai pro git)
 data/raw/
 data/staging/
+data/parquet/
 *.TXT
 *.txt
 *.zip
+*.parquet
 !requirements*.txt
 
 # amostras versionadas ficam em data/samples/ (essas SIM entram)

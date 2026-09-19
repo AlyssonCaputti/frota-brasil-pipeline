@@ -1,5 +1,5 @@
 # atalhos do dia a dia. `make help` lista tudo.
-.PHONY: help up down load year dbt test pipeline clean
+.PHONY: help up down load year parquet dbt test pipeline clean
 
 DBT_DIR := dbt
 export DBT_PROFILES_DIR := $(DBT_DIR)
@@ -23,6 +23,9 @@ year:  ## baixa e carrega o ano inteiro (ex: make year ANO=2026, precisa USE_SAM
 	python -m pipeline.download_senatran --ano $(ANO)
 	python -m pipeline.load_frota --ano $(ANO)
 	python -m pipeline.load_fipe
+
+parquet:  ## converte os TXT ja baixados do ano em parquet (ex: make parquet ANO=2026)
+	python -m pipeline.to_parquet --ano $(ANO)
 
 dbt:  ## dbt deps + seed + run
 	cd $(DBT_DIR) && dbt deps && dbt seed && dbt run
