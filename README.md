@@ -84,8 +84,8 @@ python -m pipeline.load_frota --ano 2026          # every month downloaded
 ### Multi-year backfill
 
 For several years, keep the raw months as Parquet instead of TXT — measured
-**7x smaller** on the sample, and better on the full dump, since the dump's
-columns are almost all low-cardinality:
+**18x smaller** across the seven real months of 2026 (7.80 GB → 0.43 GB), since
+the dump's columns are almost all low-cardinality:
 
 ```bash
 make backfill ANOS="2024 2025 2026"     # download → parquet → load, year by year
@@ -97,8 +97,13 @@ converting is optional. Rough sizing per year of TXT vs. Parquet:
 
 | | Months | TXT on disk | Parquet | Raw rows |
 |---|---|---|---|---|
-| 2026 so far | 7 | ~8 GB | ~1 GB | ~157M |
-| 3 full years | ~31 | ~35 GB | ~5 GB | ~700M |
+| 2026 so far | 7 | 7.8 GB | **0.43 GB** | 156,907,285 |
+| 3 full years | ~31 | ~35 GB | ~1.9 GB | ~700M |
+
+2026 is measured, the three-year row is that ratio extrapolated. **2020 is as
+far back as this goes**: the portal publishes 2018–2019 as Microsoft Access
+(`.accdb`), 2013–2014 as `.mdb` and 2015–2017 as `.rar`, none of which are read
+here — asking for an older year fails with a message saying so.
 
 Two flags worth knowing:
 
