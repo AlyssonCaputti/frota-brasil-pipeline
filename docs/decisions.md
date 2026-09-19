@@ -44,6 +44,56 @@ a full year rebuilds ~157M rows on every `dbt run`. Making them incremental on
 on `mes_referencia`: it's a 7-value column and the index would cost more during
 `COPY` than it saves on the once-per-month `delete`.
 
+## Parquet as the cheap source layer
+
+The monthly TXT is ~1.2 GB and has to be re-read in full every time. The same
+month as Parquet with zstd is **18x smaller** (1.20 GB -> 0.07 GB, measured on
+April/2026, 22.4M rows), because `uf`, `municipio` and `marca_modelo` are a
+handful of distinct values repeated millions of times and dictionary encoding
+eats that for breakfast.
+
+Columns stay as text, same five as `raw.frota_municipio`: the contract with the
+dbt staging layer doesn't change, cleaning stays where it already is. The month
+goes in the directory name (`mes_referencia=abril_2026/`), which is the Hive
+layout BigQuery expects from an external table — so this doubles as the landing
+zone for the warehouse migration.
+
+Unlike the load, a malformed row here is only counted and skipped. The 0.5%
+abort belongs to `load_frota`, where data becomes a table; this step is a format
+conversion of the source.
+
+## How far back the backfill actually goes: 2020
+
+The portal changed the dump format over the years, and only the recent half is
+usable here. Probing the tail of each yearly zip (the central directory is at
+the end, so a ranged GET of the last 64 KB reveals the filenames without
+downloading 250 MB):
+
+| Years | Inside the zip | Readable |
+|---|---|---|
+| 2013–2014 | `.mdb` | no |
+| 2015–2017 | `.rar` archives | no |
+| 2018–2019 | `.accdb` (MS Access) | no |
+| 2020–2026 | `.TXT` | yes |
+
+So "history since 2019" isn't a thing without an Access reader (`mdbtools` on
+Linux, or `access-parser`). From 2020 it's 79 months, ~9.2 GB zipped. Downloading
+January/2019 to find this out produced a 1.95 GB `.accdb` — hence `descompactar`
+now says so explicitly instead of letting the load fail with a confusing
+"fonte nao encontrada".
+
+## Resuming downloads instead of restarting them
+
+First version retried a failed download by starting the file over. That works
+for the ~130 MB months of 2026 and fails for the ~265 MB months of 2019: the
+portal drops the connection every ~100 MB, so a full restart never converges —
+it burned all 4 attempts without finishing once.
+
+The server does send `accept-ranges: bytes` and answers `206` to a ranged GET,
+so retries now resume from the bytes already on disk. First attempt still starts
+clean, since a partial left over from an older run could belong to a different
+version of the file.
+
 ## Why dbt for the transforms
 
 The normalization rules (brand de-para, model_base extraction, year validation)

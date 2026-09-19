@@ -75,9 +75,23 @@ idempotent. To pull a whole year (2026 currently publishes January–July,
 ~940 MB zipped / ~8 GB extracted / ~157M rows):
 
 ```bash
-python -m pipeline.download_senatran --ano 2026   # every month published
-python -m pipeline.load_frota --ano 2026          # every month downloaded
+python -m pipeline.download_senatran --ano 2026    # every month published
+python -m pipeline.load_frota --ano 2026           # every month downloaded
 # or: make year ANO=2026
+```
+
+`--desde 2020` downloads everything from that year onwards — **79 months, and
+2020 is as far back as this pipeline goes**: the portal ships 2018–2019 as
+Microsoft Access (`.accdb`), 2013–2014 as `.mdb` and 2015–2017 as `.rar`, none
+of which are read here. Downloads resume from where they stopped, so a dropped
+connection costs seconds instead of restarting a 250 MB file.
+
+Keeping the raw months as Parquet instead of TXT (zstd, Hive-partitioned by
+`mes_referencia`, ~18x smaller — 1.20 GB becomes 0.07 GB per month):
+
+```bash
+python -m pipeline.to_parquet --ano 2026
+# or: make parquet ANO=2026
 ```
 
 ## Results (full April/2026 dataset)
