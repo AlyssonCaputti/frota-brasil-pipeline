@@ -74,9 +74,15 @@ One month of the dump is ~1.1 GB of TXT and ~22M rows; three years would be
 Parquet (zstd + dictionary encoding), written in row groups so peak memory
 stays flat regardless of file size.
 
-Measured on the committed 75k-row sample: **7.0x smaller** (3.98 MB → 0.57 MB).
-The full dump should do better, since `municipio` and `marca_modelo` repeat far
-more across 22M rows than across 75k.
+The committed 75k-row sample gave 7.0x (3.98 MB → 0.57 MB), and the hunch that
+the full dump would do better was right by a wide margin: across all seven real
+months of 2026 it is **18.0x** (7.80 GB → 0.43 GB), consistently 18.0–18.1x
+month to month. `municipio` and `marca_modelo` repeat far more across 22M rows
+than across 75k, so the dictionary pays for itself several times over. Verified
+by round-trip against the TXT: same 22,126,367 rows and same fleet total of
+132,424,106 on both sides.
+
+So three years is ~1.9 GB of Parquet, not the ~5 GB the sample ratio suggested.
 
 Everything stays string-typed, exactly like `raw_ddl.sql` — casting here would
 mean deciding the schema before looking at the data, which is precisely what
@@ -91,6 +97,40 @@ Deliberately **not** done: moving the warehouse to DuckDB-over-Parquet. It is
 arguably the right long-term shape for 700M rows, but it swaps the engine
 (`unaccent` doesn't exist in DuckDB, the loads are psycopg2, CI would change)
 and nothing has been measured yet showing Postgres as the bottleneck.
+
+## Resuming downloads instead of restarting them
+
+A failed download used to start the file over, on the assumption that Range
+wasn't reliable here. It is: the portal sends `accept-ranges: bytes` and answers
+`206` with a correct `content-range` to a ranged GET.
+
+That assumption cost a whole backfill. The ~130 MB months of 2026 survive a
+restart; the ~265 MB months of 2018–2019 don't, because the connection drops
+every ~100 MB and a restart never gets further than the previous attempt —
+January/2019 burned every retry without completing once. With resume it
+finished through three consecutive drops (56 → 111 → 168 → 266 MB).
+
+The first attempt still starts clean, since a partial left over from an earlier
+run could belong to a different version of the file. A corrupted concatenation
+would be caught by the zip CRC anyway, but not starting one is cheaper.
+
+## How far back the backfill goes: 2020
+
+Probing the tail of each yearly zip (the central directory sits at the end, so a
+ranged GET of the last 64 KB lists the contents without downloading 250 MB):
+
+| Years | Inside the zip | Readable |
+|---|---|---|
+| 2013–2014 | `.mdb` | no |
+| 2015–2017 | `.rar` archives | no |
+| 2018–2019 | `.accdb` (MS Access) | no |
+| 2020–2026 | `.TXT` | yes |
+
+Finding this out the slow way produced a 1.95 GB `.accdb` from January/2019, so
+`descompactar` now refuses a zip with no TXT in it and says why, instead of
+letting the failure surface as "fonte nao encontrada" several steps later.
+Reading the Access years would need `mdbtools` or `access-parser` — a new
+extractor, not a tweak.
 
 ## Why dbt for the transforms
 

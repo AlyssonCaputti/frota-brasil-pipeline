@@ -56,12 +56,19 @@ def meses_publicados():
     return {mes: url for _, mes, url in sorted(achados)}
 
 
-def _stream(url, destino):
-    with requests.get(url, stream=True, timeout=600) as r:
+def _stream(url, destino, ja_baixado=0):
+    cabecalhos = {"Range": f"bytes={ja_baixado}-"} if ja_baixado else {}
+    with requests.get(url, stream=True, timeout=600, headers=cabecalhos) as r:
         r.raise_for_status()
+        # 206 = aceitou o Range. se vier 200 o servidor ignorou e vai mandar o
+        # arquivo inteiro, entao escreve do zero em vez de concatenar.
+        retomando = r.status_code == 206
         total = int(r.headers.get("content-length", 0))
         baixado = 0
-        with open(destino, "wb") as f:
+        if retomando:
+            total += ja_baixado
+            baixado = ja_baixado
+        with open(destino, "ab" if retomando else "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
                 f.write(chunk)
                 baixado += len(chunk)
@@ -80,12 +87,17 @@ def baixar(url: str, destino, tentativas=6):
     destino.parent.mkdir(parents=True, exist_ok=True)
     print(f"baixando {url}")
     for i in range(tentativas):
+        # 1a tentativa sempre do zero: parcial de uma execucao antiga pode ser
+        # de outra versao do arquivo. da 2a em diante retoma do offset ja
+        # gravado - o portal manda accept-ranges: bytes e responde 206. sem
+        # isso um arquivo de ~265 MB (2018-2019) nao fecha numa conexao que
+        # cai a cada ~100 MB: queima as tentativas reiniciando do inicio.
+        ja_baixado = destino.stat().st_size if i and destino.exists() else 0
         try:
-            return _stream(url, destino)
+            return _stream(url, destino, ja_baixado)
         except requests.RequestException as e:
             # o portal corta a conexao no meio de um arquivo de ~130MB de vez
-            # em quando (IncompleteRead). recomeca o arquivo do zero - Range
-            # aqui nao e confiavel.
+            # em quando (IncompleteRead).
             #
             # 15s dobrando: com 1/2/4/8s eu desistia de mes que estava no ar,
             # porque o portal comeca a devolver HTTPError depois de alguns
@@ -93,17 +105,30 @@ def baixar(url: str, destino, tentativas=6):
             if i == tentativas - 1:
                 break
             espera = 15 * 2 ** i
-            print(f"\n  caiu em {type(e).__name__}, tentando de novo em {espera}s")
+            tam = destino.stat().st_size if destino.exists() else 0
+            print(
+                f"\n  caiu em {type(e).__name__} com {tam / 1e6:.0f} MB, "
+                f"retomando em {espera}s"
+            )
             time.sleep(espera)
     raise RuntimeError(f"desisti de {url} depois de {tentativas} tentativas")
 
 
 def descompactar(zip_path):
     with zipfile.ZipFile(zip_path) as z:
-        # o zip tem um unico TXT dentro
-        nome_txt = z.namelist()[0]
-        z.extractall(zip_path.parent)
-    return zip_path.parent / nome_txt
+        # de 2020 em diante o zip traz um TXT. antes disso o portal publicava
+        # banco Access (2018-2019 em .accdb, 2013-2014 em .mdb) e 2015-2017 nem
+        # zip e: extrair aquilo daria um .accdb de ~2 GB e o load reclamaria de
+        # "fonte nao encontrada" varios passos depois.
+        txts = [n for n in z.namelist() if n.lower().endswith(".txt")]
+        if not txts:
+            raise SystemExit(
+                f"{zip_path.name} nao tem TXT dentro: {z.namelist()}. "
+                "dumps anteriores a 2020 vem em Access (.mdb/.accdb), "
+                "formato que este pipeline nao le."
+            )
+        z.extract(txts[0], zip_path.parent)
+    return zip_path.parent / txts[0]
 
 
 def main(argv=None):
