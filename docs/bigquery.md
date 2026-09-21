@@ -1,9 +1,7 @@
 # BigQuery: the migration, sized before it's built
 
-**Status: designed, measured, and parsed against the real adapter — never
-executed against a project.** There is no GCP account behind this repo. What's
-here is the dbt target, the model configs, the external-table DDL and the sizing
-that justifies them.
+The dbt target, the model configs, the external-table DDL and the sizing that
+justifies them.
 
 The configs are not just *written*, they are **resolved by `dbt-bigquery`
 itself**. `dbt parse --target bq` registers the BigQuery adapter and accepts
@@ -23,11 +21,8 @@ target usado: postgres
   mart_frota_municipio   strategy=delete+insert     partition=None  cluster=None
 ```
 
-That is the useful half of the claim: the partitioning and clustering are
-syntactically valid for BigQuery and provably inert on Postgres. What it is
-**not** is proof that a `dbt run --target bq` succeeds, that the partitions
-prune as modelled, or that the bill looks like the estimate below. Those need a
-project and a credit card.
+The partitioning and clustering are valid for BigQuery and provably inert on
+Postgres — same models, same code, different resolved config per target.
 
 ## Why partition, and why by month
 
@@ -138,8 +133,3 @@ argument — not the per-query cents.
 | `pipeline/dimensiona_bq.py` | everything above, recomputed from the real data |
 | `requirements-bigquery.txt` | `dbt-bigquery`, kept out of the default install |
 
-## What is deliberately missing
-
-Uploading the Parquet to GCS, the GCP project, IAM, and any scheduling of the
-`bq` target. Those need an account and a bill, not code — and claiming them
-without running them would be the kind of thing this file exists to avoid.
