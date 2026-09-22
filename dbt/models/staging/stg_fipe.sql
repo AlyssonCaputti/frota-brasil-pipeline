@@ -27,19 +27,20 @@ select
     -- e ai VW e Chevrolet, #1 e #3 da frota, caem inteiras na whitelist.
     -- Corta o que vem antes de " - "; Mercedes-Benz e Rolls-Royce tem hifen
     -- colado e nao sao afetadas.
-    {{ norm_txt("split_part(marca_nome, ' - ', -1)") }} as marca_fipe,
+    {{ norm_txt(_depois_do_ultimo('marca_nome', ' - ')) }} as marca_fipe,
     modelo_nome,
     {{ model_base('modelo_nome') }}                 as modelo_base,
     -- cilindrada: primeiro "N.N" do nome
-    (regexp_match(modelo_nome, '([0-9]\.[0-9])'))[1] as motor,
+    {{ _regexp_extract('modelo_nome', '([0-9]\.[0-9])') }} as motor,
     -- potencia: numero antes de "cv" (case-insensitive)
-    (regexp_match(modelo_nome, '([0-9]{2,3})\s*cv', 'i'))[1]::int as potencia_cv,
+    cast({{ _regexp_extract('modelo_nome', '([0-9]{2,3})\\s*cv', case_insensitive=true) }}
+         as {{ dbt.type_bigint() }})                as potencia_cv,
     case
-        when modelo_nome ~* 'diesel|tdi|crdi|dci'      then 'Diesel'
-        when modelo_nome ~* 'eletric|ev\b|100%'        then 'Eletrico'
-        when modelo_nome ~* 'hybrid|hibrid'            then 'Hibrido'
-        when modelo_nome ~* 'flex'                     then 'Flex'
-        when modelo_nome ~* 'gasolina|gas\.'           then 'Gasolina'
-        when modelo_nome ~* '\balcool\b|etanol'        then 'Alcool'
+        when {{ _regexp_match_i('modelo_nome', 'diesel|tdi|crdi|dci') }}      then 'Diesel'
+        when {{ _regexp_match_i('modelo_nome', 'eletric|ev\\b|100%') }}        then 'Eletrico'
+        when {{ _regexp_match_i('modelo_nome', 'hybrid|hibrid') }}            then 'Hibrido'
+        when {{ _regexp_match_i('modelo_nome', 'flex') }}                     then 'Flex'
+        when {{ _regexp_match_i('modelo_nome', 'gasolina|gas\\.') }}          then 'Gasolina'
+        when {{ _regexp_match_i('modelo_nome', '\\balcool\\b|etanol') }}      then 'Alcool'
     end                                             as combustivel
 from fonte
