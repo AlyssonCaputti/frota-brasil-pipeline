@@ -30,7 +30,10 @@ jobs:
       PGDATABASE: frota
       PGUSER: frota
       PGPASSWORD: frota
-      DBT_PROFILES_DIR: dbt
+      # absoluto de proposito: o step de deps+parse muda pra working-directory
+      # dbt, e um caminho relativo aqui resolveria contra esse cwd (dbt/dbt),
+      # nao contra a raiz do checkout.
+      DBT_PROFILES_DIR: ${{ github.workspace }}/dbt
 
     steps:
       - uses: actions/checkout@v4
