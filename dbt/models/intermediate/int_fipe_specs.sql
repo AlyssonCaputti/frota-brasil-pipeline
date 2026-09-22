@@ -18,7 +18,7 @@ select
     count(*)                                            as n_versoes,
     string_agg(distinct motor, '; ' order by motor)     as motores,
     string_agg(distinct combustivel, '; ' order by combustivel) as combustiveis,
-    percentile_cont(0.5) within group (order by potencia_cv) as potencia_cv_mediana
+    {{ _mediana('potencia_cv') }} as potencia_cv_mediana
 from fipe
 where modelo_base <> ''
 group by 1, 2
