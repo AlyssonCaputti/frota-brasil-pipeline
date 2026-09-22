@@ -24,6 +24,28 @@ target usado: postgres
 The partitioning and clustering are valid for BigQuery and provably inert on
 Postgres — same models, same code, different resolved config per target.
 
+That was true for the configs; it wasn't true for the SQL underneath them.
+Running the staging layer against a real BigQuery Sandbox project (free, no
+billing) failed on the first two models: `unaccent()`, `substring(x from
+position(...))`, raw `split_part`, `!~`/`~*`, and `percentile_cont(...) within
+group (...)` are all Postgres-only. Fixed with a `target.type == 'bigquery'`
+branch per divergence (`_sem_acento`, `_regexp_extract`, `_mediana`, etc. — see
+`docs/decisions.md`). The run then found a second, unrelated bug: `de_para_marca`
+had two normalized-key collisions causing row fan-out in `stg_frota`, latent on
+Postgres too, invisible in the headline numbers only because the affected
+brand (Mercedes-Benz) doesn't survive the FIPE whitelist. Both fixed and
+verified — `dbt test` passes 12/12 on Postgres, and `stg_frota`/`stg_fipe`/
+`int_fipe_specs`/`int_frota_carros` all built on real BigQuery with row counts
+matching Postgres exactly (22,423,952 / 7,366 / 991 / 13,024,622).
+
+What didn't get proven end-to-end: the final partitioned marts, against our
+April/2026 test data. Not a bug — BigQuery Sandbox enforces a 60-day partition
+expiration that can't be overridden (`OPTIONS(partition_expiration_days=null)`
+does nothing), and April/2026 is well past that window relative to today. A
+synthetic single-row repro with a current-day partition value confirms the
+exact same `CREATE TABLE ... PARTITION BY ... CLUSTER BY ... AS` populates
+correctly — the DDL is right, Sandbox just won't retain historical partitions.
+
 ## Why partition, and why by month
 
 BigQuery on-demand bills **logical bytes of the columns a query reads**, inside

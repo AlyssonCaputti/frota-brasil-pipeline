@@ -159,6 +159,88 @@ honest next step is `mdb-export` from mdbtools on Linux, which reads the file
 format directly rather than through the Access engine — untested here, since
 mdbtools has no Windows build and this machine has no Linux.
 
+## Making the staging layer actually cross-dialect
+
+`norm_txt`/`model_base` compiled fine on Postgres and were assumed portable
+because the BigQuery target parsed and resolved partition/cluster configs
+correctly. Parsing isn't running: the first real `dbt run --target bq`
+failed on the very first two models, because the staging layer used a pile
+of Postgres-only syntax that dbt's Jinja layer never checks:
+
+- `unaccent()` — a Postgres extension function, no BigQuery equivalent at all.
+- `regexp_replace(str, pattern, repl, 'g')` — the 4th "global" flag arg;
+  BigQuery's `REGEXP_REPLACE` has no flags and already replaces every match.
+- `substring(x from position(y in x) + 1)` — ANSI syntax BigQuery doesn't
+  parse. `substr()`/`strpos()` are functions, not syntax, and exist with the
+  same signature on both engines — swapping to those needed no new macro.
+- `split_part()` raw — Postgres-only; `dbt.split_part()` is the cross-dialect
+  version already used by `mes_para_data`.
+- `!~` / `~` / `~*` (regex non-match, match, case-insensitive match) — none
+  exist on BigQuery, which uses `REGEXP_CONTAINS(str, r'...')`, with `(?i)`
+  prefixed onto the pattern for case-insensitivity.
+- `(regexp_match(str, pattern))[1]` — Postgres returns an array you index;
+  BigQuery's `REGEXP_EXTRACT` returns the captured group directly.
+- `percentile_cont(0.5) within group (order by x)` — an ordered-set aggregate
+  syntax BigQuery doesn't recognize as an aggregate at all (there it's an
+  analytic/window function, incompatible with a plain `GROUP BY`).
+  `APPROX_QUANTILES(x, 2)[OFFSET(1)]` is the closest aggregate equivalent —
+  approximate rather than exact, acceptable here since it only guards against
+  one outlier trim pulling the median.
+
+Each divergence got a `target.type == 'bigquery'` branch in a macro
+(`_sem_acento`, `_regexp_replace_g`, `_regexp_match`, `_regexp_match_i`,
+`_regexp_extract`, `_split_part`, `_depois_do_primeiro`, `_depois_do_ultimo`,
+`_mediana`), so the Postgres branch is untouched byte-for-byte and the
+BigQuery branch is what actually ran and got verified against real data.
+
+## A real bug the BigQuery run surfaced: de-para fan-out
+
+Getting the staging layer to compile was necessary but not sufficient —
+`stg_frota` still produced 23,233,938 rows against a `raw.frota_municipio`
+of exactly 22,423,952. The extra ~810k rows were a genuine, pre-existing
+duplication bug, present in Postgres too (not something the BigQuery port
+introduced): `de_para_marca` has two collisions after normalization —
+`M.BENZ`/`M BENZ` and `MERCEDES BENZ`/`MERCEDES-BENZ` both collapse to the
+same key, so the `left join` in `stg_frota` fanned out, attaching the same
+`marca_padrao` to a frota row twice.
+
+It never showed up in the headline numbers because Mercedes-Benz doesn't
+survive the FIPE whitelist join in `int_frota_carros` — the duplicate rows
+got filtered out before they could inflate `mart_frota_municipio`'s totals.
+That's luck, not correctness: the day a colliding brand *does* survive the
+whitelist, its fleet count silently doubles.
+
+Fixed at the root: `stg_frota` now joins against a `select distinct
+(normalized_key, marca_padrao)` view of the seed instead of the raw seed
+with an inline `norm_txt()` on the join condition. That collapses the two
+known collisions (they map to the same `marca_padrao`) without picking a
+side arbitrarily. `assert_de_para_marca_sem_colisao` is the safety net for
+the worse case — a normalized key mapping to *different* `marca_padrao`
+values, where `distinct` wouldn't be enough and the fan-out would come back.
+
+## Running dbt against a real BigQuery project (Sandbox, no billing)
+
+Cheap and honest way to test the BigQuery target beyond `dbt parse`: BigQuery
+Sandbox gives a real GCP project with no credit card, ~1 TB query processing
+and 10 GB storage free, permanently. `dbt run --target bq` against it, with
+`raw.frota_municipio` and `raw.fipe_versoes` loaded from the same April/2026
+data already validated on Postgres, is what caught both issues above.
+
+It also surfaced a Sandbox-specific limit worth knowing, not a pipeline bug:
+partitioned tables in Sandbox mode carry a hard 60-day partition expiration
+(`OPTIONS(partition_expiration_days=...)` does not override it — tried,
+confirmed with a 2-row synthetic repro). Our test partition value was
+`2026-04-01`; against the real server date (`CURRENT_DATE()`, verified
+directly), that's ~174 days old, well past the 60-day floor, so the
+partitioned `CREATE TABLE ... AS SELECT` runs, scans the source rows (visible
+in the job's bytes-processed stat), and writes zero rows — silently, no
+error. The same DDL with a recent partition value populates normally
+(confirmed with a synthetic single-row repro), so the partition/cluster
+logic itself is correct; it's the historical test data that Sandbox won't
+retain. Proving the marts populate against a *current* month would need
+either a project with billing enabled or waiting for data inside the
+60-day window — out of scope for what this repo needs to demonstrate.
+
 ## Why dbt for the transforms
 
 The normalization rules (brand de-para, model_base extraction, year validation)
