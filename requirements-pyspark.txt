@@ -1,0 +1,4 @@
+# pipeline/to_parquet_spark.py: alternativa ao to_parquet.py, medida contra
+# ele em docs/decisions.md. Fora do requirements.txt de proposito - o CI e o
+# caminho padrao nao precisam de JVM nem de PySpark.
+pyspark==3.5.3

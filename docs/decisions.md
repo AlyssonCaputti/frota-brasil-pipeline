@@ -98,6 +98,41 @@ arguably the right long-term shape for 700M rows, but it swaps the engine
 (`unaccent` doesn't exist in DuckDB, the loads are psycopg2, CI would change)
 and nothing has been measured yet showing Postgres as the bottleneck.
 
+## A PySpark path for the same conversion, and why production stays as-is
+
+`pipeline/to_parquet_spark.py` is an alternative TXT→Parquet converter, not a
+replacement — it exists to measure Spark against the pipeline above, not
+because ~700M rows (~1.9 GB of Parquet) needs it. That fits in memory on one
+machine, which is exactly what `to_parquet.py` already does in constant
+memory. Running it in `local[*]` mode is honest about that: there's no
+cluster here, and it would be dishonest to imply otherwise.
+
+Measured on April/2026 (22,423,952 rows), same machine, same file:
+
+| | Time | Notes |
+|---|---|---|
+| `to_parquet.py` (pandas/pyarrow, single-threaded `csv.reader`) | 105.3s | one Python thread parsing row by row |
+| `to_parquet_spark.py` (`local[*]`, 28 cores) | 23.2–30.4s | parallel CSV parse + Parquet write |
+
+Spark came out **3.5–4.5x faster** — the opposite of what I expected going in.
+Not because "Spark is faster": because the bottleneck in the current path is
+CPU-bound, single-threaded, pure-Python CSV parsing, and this machine has 28
+cores Spark can split the file across. On a 4-core machine the JVM startup
+cost would eat most of that advantage; the gain is a property of this
+hardware and this specific bottleneck, not a general Spark-vs-Python verdict.
+
+Round-trip verified: both Parquets have the same 22,423,952 rows, the same
+`133,852,588` fleet total (`qtd_veiculos` summed after trimming — Arrow's
+cast doesn't tolerate the `" 2.0"` leading space the raw TXT carries, unlike
+Python's `float()`), and the same five columns.
+
+Production stays on `to_parquet.py`: no JVM dependency, no `HADOOP_HOME`/
+`winutils.exe` dance to get Parquet writes working on Windows (needed here —
+Spark's Hadoop compatibility layer fails on temp-dir creation without it), and
+the current path is already proven at the real backfill volumes. The
+speed-up is real and worth revisiting if CSV-parsing throughput ever becomes
+the actual bottleneck; it isn't yet.
+
 ## Resuming downloads instead of restarting them
 
 A failed download used to start the file over, on the assumption that Range
