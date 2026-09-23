@@ -91,47 +91,72 @@ landing raw as text already avoids.
 `load_frota.py` prefers the Parquet when it exists and falls back to the TXT
 otherwise, so nobody who already has TXT files on disk has to convert. Parquet
 is a *cold copy*, not a replacement for Postgres: it exists so a month can be
-reprocessed without re-downloading 130 MB.
+reprocessed without re-downloading 130 MB. (This module is no longer the one
+that produces that Parquet in production — see below.)
 
 Deliberately **not** done: moving the warehouse to DuckDB-over-Parquet. It is
 arguably the right long-term shape for 700M rows, but it swaps the engine
 (`unaccent` doesn't exist in DuckDB, the loads are psycopg2, CI would change)
 and nothing has been measured yet showing Postgres as the bottleneck.
 
-## A PySpark path for the same conversion, and why production stays as-is
+## Moving parquet conversion to PySpark
 
-`pipeline/to_parquet_spark.py` is an alternative TXT→Parquet converter, not a
-replacement — it exists to measure Spark against the pipeline above, not
-because ~700M rows (~1.9 GB of Parquet) needs it. That fits in memory on one
-machine, which is exactly what `to_parquet.py` already does in constant
-memory. Running it in `local[*]` mode is honest about that: there's no
-cluster here, and it would be dishonest to imply otherwise.
+`pipeline/to_parquet_spark.py` replaced `to_parquet.py` as the converter the
+Makefile and `download_senatran.py --parquet` actually call. Not because
+~700M rows (~1.9 GB of Parquet) needs Spark — that still fits in memory on
+one machine, which is exactly what `to_parquet.py` already did in constant
+memory. The volume didn't force this; it was a deliberate call to put a real,
+measured PySpark path into production rather than leave it as an unused
+line in a requirements file. `to_parquet.py` stays in the repo, unchanged and
+still tested, as the no-JVM fallback and the baseline the numbers below are
+measured against.
 
 Measured on April/2026 (22,423,952 rows), same machine, same file:
 
-| | Time | Notes |
-|---|---|---|
-| `to_parquet.py` (pandas/pyarrow, single-threaded `csv.reader`) | 105.3s | one Python thread parsing row by row |
-| `to_parquet_spark.py` (`local[*]`, 28 cores) | 23.2–30.4s | parallel CSV parse + Parquet write |
+| | Time |
+|---|---|
+| `to_parquet.py` (pandas/pyarrow, single-threaded `csv.reader`) | 105.3s |
+| `to_parquet_spark.py`, `local[*]` (28 cores) | 20.2–30.4s |
+| `to_parquet_spark.py`, `local[2]` (closer to a CI/Airflow worker) | 71.6s |
 
-Spark came out **3.5–4.5x faster** — the opposite of what I expected going in.
-Not because "Spark is faster": because the bottleneck in the current path is
-CPU-bound, single-threaded, pure-Python CSV parsing, and this machine has 28
-cores Spark can split the file across. On a 4-core machine the JVM startup
-cost would eat most of that advantage; the gain is a property of this
-hardware and this specific bottleneck, not a general Spark-vs-Python verdict.
+Spark wins in both cases (**3.5–5.2x** on 28 cores, **~1.5x** on 2), but not
+because "Spark is faster" — the bottleneck in `to_parquet.py` is CPU-bound,
+single-threaded, pure-Python CSV parsing, and Spark splits that work across
+whatever cores are available. On a 2-core CI runner the JVM startup cost eats
+most of the advantage; the size of the win is a property of the hardware and
+this specific bottleneck, not a general verdict.
 
-Round-trip verified: both Parquets have the same 22,423,952 rows, the same
-`133,852,588` fleet total (`qtd_veiculos` summed after trimming — Arrow's
-cast doesn't tolerate the `" 2.0"` leading space the raw TXT carries, unlike
-Python's `float()`), and the same five columns.
+**A mistake worth recording, because it reversed the entire result once.**
+The first production version forced Spark to write a single file
+(`.coalesce(1)`) to match `to_parquet.py`'s layout, so `load_frota.py` and
+`download_senatran.py` wouldn't need to know which converter produced the
+Parquet. That serialized the write into one task and **cost more than Spark's
+parallel read saved** — 131.8s, slower than the 105.3s baseline it was meant
+to beat. The actual fix: keep Spark's native output (a directory of
+part-files, written in parallel) and change the *reader* instead.
+`load_frota.py`'s `_ler_parquet` now opens the source with
+`pyarrow.dataset.dataset(...)`, which reads a single file or a directory of
+part-files identically — so `to_parquet.py`'s and `to_parquet_spark.py`'s
+outputs are interchangeable without either one bending its native write
+format to imitate the other. Forcing a shared *file* layout was the wrong
+compatibility boundary; a shared *reader* was the right one.
 
-Production stays on `to_parquet.py`: no JVM dependency, no `HADOOP_HOME`/
-`winutils.exe` dance to get Parquet writes working on Windows (needed here —
-Spark's Hadoop compatibility layer fails on temp-dir creation without it), and
-the current path is already proven at the real backfill volumes. The
-speed-up is real and worth revisiting if CSV-parsing throughput ever becomes
-the actual bottleneck; it isn't yet.
+Round-trip verified at each step: same 22,423,952 rows, same `133,852,588`
+fleet total (`qtd_veiculos` summed after trimming — Arrow's cast doesn't
+tolerate the `" 2.0"` leading space the raw TXT carries, unlike Python's
+`float()`), same five columns — and confirmed again after switching to the
+directory-based output by loading it through `load_frota.py` into Postgres:
+22,423,952 rows landed, same fleet total.
+
+Real costs accepted with this move, not hidden: a JVM dependency where there
+was none before; the job warns about exceeding 95% of default heap on a
+single month, so production heap sizing needs attention before this scales
+past one month at a time; and on Windows, Spark's Hadoop compatibility layer
+needs `HADOOP_HOME` pointing at a `winutils.exe`/`hadoop.dll` pair (fetched
+here for Hadoop 3.3.5, close enough to the bundled 3.3.4) to create temp dirs
+at all — Linux doesn't hit this, but that claim is based on how Hadoop's
+`Shell` class is documented to behave, not on having tested this repo's CI
+on Linux at the time of writing.
 
 ## Resuming downloads instead of restarting them
 

@@ -190,7 +190,11 @@ def main(argv=None):
         # o zip nao serve mais - a fonte do load e o TXT (ou o parquet)
         zip_path.unlink(missing_ok=True)
         if args.parquet:
-            to_parquet.converter(mes, apagar_txt=True)
+            # import tardio: quem so baixa (sem --parquet) nao devia
+            # precisar de pyspark/JVM instalado so pra importar este modulo.
+            from pipeline import to_parquet_spark
+
+            to_parquet_spark.converter(mes, apagar_txt=True)
         baixados += 1
     return 0
 

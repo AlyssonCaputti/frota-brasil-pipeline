@@ -34,8 +34,8 @@ backfill:  ## baixa+carrega varios anos em parquet (ex: make backfill ANOS="2024
 	done
 	python -m pipeline.load_fipe
 
-parquet:  ## converte os TXT ja baixados de um ano em parquet (ex: make parquet ANO=2026)
-	python -m pipeline.to_parquet --ano $(ANO) --apagar-txt
+parquet:  ## converte os TXT ja baixados de um ano em parquet via PySpark (ex: make parquet ANO=2026)
+	python -m pipeline.to_parquet_spark --ano $(ANO) --apagar-txt
 
 dbt:  ## dbt deps + seed + run
 	cd $(DBT_DIR) && dbt deps && dbt seed && dbt run
