@@ -297,9 +297,29 @@ in the job's bytes-processed stat), and writes zero rows — silently, no
 error. The same DDL with a recent partition value populates normally
 (confirmed with a synthetic single-row repro), so the partition/cluster
 logic itself is correct; it's the historical test data that Sandbox won't
-retain. Proving the marts populate against a *current* month would need
-either a project with billing enabled or waiting for data inside the
-60-day window — out of scope for what this repo needs to demonstrate.
+retain. Offered the choice explicitly — enable billing to remove the limit,
+or accept it and document it — the call was to accept it: stay on the free
+Sandbox and be precise about what "in production" means here rather than
+attach a real credit card to make a test pass.
+
+A third bug turned up on a later full re-run: `assert_cobertura_specs.sql`
+used `filter (where combustiveis is not null)` inside a `sum` and a
+`frota_com_spec::numeric` cast — both Postgres-only (`FILTER` on an aggregate
+isn't valid BigQuery syntax at all; `::` isn't either). Fixed the same way as
+everything else in the staging layer: `sum(case when ... then qtd_veiculos
+else 0 end)` and `dbt.type_numeric()`, portable on both engines, re-verified
+against real (non-empty) data on Postgres to confirm the fix wasn't just
+passing because the input was empty.
+
+With that fixed, `dbt test --target bq` is 13/13 — but the honest reading of
+that number matters: the mart tables are empty (the 60-day expiration above),
+so `not_null`, `accepted_range` and `unique_combination_of_columns` all pass
+**trivially** — zero rows means nothing to violate. That 13/13 is not
+evidence the marts are correct on BigQuery. What *is* evidence: `stg_frota`,
+`stg_fipe`, `int_fipe_specs` and `int_frota_carros` are views (recomputed on
+every query, so they can't be hollowed out by partition expiration the way a
+table can), and their row counts match Postgres exactly. The transform SQL is
+proven; only the final table's retention is bounded by the free tier.
 
 ## Why dbt for the transforms
 

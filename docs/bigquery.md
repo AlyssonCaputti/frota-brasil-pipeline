@@ -33,18 +33,35 @@ branch per divergence (`_sem_acento`, `_regexp_extract`, `_mediana`, etc. — se
 `docs/decisions.md`). The run then found a second, unrelated bug: `de_para_marca`
 had two normalized-key collisions causing row fan-out in `stg_frota`, latent on
 Postgres too, invisible in the headline numbers only because the affected
-brand (Mercedes-Benz) doesn't survive the FIPE whitelist. Both fixed and
-verified — `dbt test` passes 12/12 on Postgres, and `stg_frota`/`stg_fipe`/
-`int_fipe_specs`/`int_frota_carros` all built on real BigQuery with row counts
-matching Postgres exactly (22,423,952 / 7,366 / 991 / 13,024,622).
+brand (Mercedes-Benz) doesn't survive the FIPE whitelist. A third, in the test
+suite itself: `assert_cobertura_specs.sql` used `filter (where ...)` on an
+aggregate and a `::numeric` cast, neither valid on BigQuery — `case when ...
+then ... else 0 end` inside the `sum` and `dbt.type_numeric()` fixed it,
+portable on both engines. All three fixed and verified.
 
-What didn't get proven end-to-end: the final partitioned marts, against our
-April/2026 test data. Not a bug — BigQuery Sandbox enforces a 60-day partition
-expiration that can't be overridden (`OPTIONS(partition_expiration_days=null)`
-does nothing), and April/2026 is well past that window relative to today. A
-synthetic single-row repro with a current-day partition value confirms the
-exact same `CREATE TABLE ... PARTITION BY ... CLUSTER BY ... AS` populates
-correctly — the DDL is right, Sandbox just won't retain historical partitions.
+`dbt run --target bq` builds all 6 models; `dbt test --target bq` passes
+13/13. `stg_frota`/`stg_fipe`/`int_fipe_specs`/`int_frota_carros` (views, so
+they compute fresh on every query rather than storing rows) match Postgres
+exactly on row count: 22,423,952 / 7,366 / 991 / 13,024,622.
+
+**What that 13/13 does not prove, and this is the honest part:** the
+partitioned mart *tables* built empty. BigQuery Sandbox enforces a 60-day
+partition expiration that cannot be overridden — `OPTIONS
+(partition_expiration_days=null)` does nothing, confirmed directly — and every
+SENATRAN month published so far (through July/2026) is already past that
+window relative to today. `dbt run` genuinely scans the ~13M source rows
+(visible in the job's bytes-processed stat) and writes zero, silently, no
+error. With the marts empty, `not_null`, `accepted_range` and
+`unique_combination_of_columns` all pass **trivially** — there's no row left
+to violate any of them. That is not evidence the marts are correct on
+BigQuery; it's evidence the table is empty. A synthetic single-row repro with
+a current-day partition value confirms the exact same `CREATE TABLE ...
+PARTITION BY ... CLUSTER BY ... AS` populates correctly when the date is
+recent enough to survive — the DDL and the incremental logic are right, and
+the view layer above proves the transform SQL is right; Sandbox's retention
+policy is the only thing standing between this and a fully populated mart on
+real historical data, and removing it requires enabling billing on the
+project, which hasn't been done.
 
 ## Why partition, and why by month
 
