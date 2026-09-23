@@ -7,6 +7,12 @@ na amostra). Guardo em row groups pra nunca segurar o mes todo em memoria.
 Isso e copia fria pra reprocessar um mes sem baixar de novo - nao substitui o
 Postgres. O load_frota le daqui quando o arquivo existe.
 
+Deixou de ser o caminho de producao (Makefile/download_senatran chamam
+to_parquet_spark.py agora, ver docs/decisions.md) - fica no repo como
+fallback sem dependencia de JVM e como base de comparacao do benchmark.
+Continua funcional: escreve no mesmo caminho, entao da pra rodar isso aqui
+na mao se o Spark nao estiver disponivel.
+
 Uso:
     python -m pipeline.to_parquet                  # mes do .env
     python -m pipeline.to_parquet --mes maio_2026
@@ -16,6 +22,7 @@ Uso:
 
 import argparse
 import csv
+import shutil
 import sys
 
 import pyarrow as pa
@@ -112,6 +119,10 @@ def converter(mes: str, apagar_txt=False):
         tmp.unlink(missing_ok=True)
         raise SystemExit(f"{fonte.name} nao tem linha de dado valida, abortei")
 
+    # se o to_parquet_spark.py rodou nesse mes antes, destino e um diretorio
+    # de part-files - Path.replace() nao troca arquivo por diretorio.
+    if destino.is_dir():
+        shutil.rmtree(destino)
     tmp.replace(destino)
 
     tam_txt = fonte.stat().st_size

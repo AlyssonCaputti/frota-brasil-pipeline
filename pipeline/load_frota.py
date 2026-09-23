@@ -4,8 +4,12 @@ Le em streaming e usa COPY do postgres (via copy_expert) por batches -
 o arquivo full tem 22M linhas, nao da pra segurar em memoria nem fazer
 INSERT linha a linha.
 
-Prefiro o Parquet do mes quando existe (ver to_parquet.py) e caio no TXT
-quando nao, pra quem ja baixou os TXT nao ter que converter.
+Prefiro o Parquet do mes quando existe e caio no TXT quando nao, pra quem
+ja baixou os TXT nao ter que converter. O parquet e gerado pelo
+to_parquet_spark.py (producao) ou pelo to_parquet.py (fallback/comparacao,
+ver docs/decisions.md) - os dois escrevem no mesmo caminho
+(to_parquet.caminho_parquet), entao esse modulo nao precisa saber qual dos
+dois gerou o arquivo.
 
 Cada mes e uma particao logica por mes_referencia: o load apaga so o mes
 que esta entrando, entao recarregar um mes e idempotente e os outros meses
@@ -95,15 +99,18 @@ def _ler_txt(fonte, mes, descarte):
 
 
 def _ler_parquet(fonte, mes, descarte):
-    """Gera as tuplas do Parquet, por row group.
+    """Gera as tuplas do Parquet, por batch.
 
-    Nao toco em `descarte`: o to_parquet ja contou as linhas tortas e o
-    schema garante as 5 colunas.
+    pyarrow.dataset (nao pq.ParquetFile) de proposito: abre arquivo unico
+    (to_parquet.py) ou diretorio de part-files (to_parquet_spark.py) do
+    mesmo jeito, sem esse modulo precisar saber qual dos dois gerou o
+    arquivo. Nao toco em `descarte`: quem gerou o parquet ja contou as
+    linhas tortas e o schema garante as 5 colunas.
     """
-    import pyarrow.parquet as pq
+    import pyarrow.dataset as ds
 
-    arquivo = pq.ParquetFile(fonte)
-    for lote in arquivo.iter_batches(batch_size=BATCH, columns=to_parquet.COLUNAS):
+    dataset = ds.dataset(fonte, format="parquet")
+    for lote in dataset.to_batches(batch_size=BATCH, columns=to_parquet.COLUNAS):
         colunas = [lote.column(c).to_pylist() for c in to_parquet.COLUNAS]
         for uf, mun, mm, ano, qtd in zip(*colunas):
             yield (uf, mun, mm, ano, qtd, mes)
