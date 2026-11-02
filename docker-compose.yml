@@ -7,7 +7,7 @@ services:
       POSTGRES_USER: frota
       POSTGRES_PASSWORD: frota
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"  # só local: a senha é de desenvolvimento
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

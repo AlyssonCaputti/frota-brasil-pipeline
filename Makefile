@@ -1,49 +1,47 @@
-# atalhos do dia a dia. `make help` lista tudo.
-.PHONY: help up down load year backfill parquet dbt test pipeline clean
+# Atalhos do dia a dia. `make help` lista tudo.
+.PHONY: help up down load dbt test pipeline year backfill parquet check clean
 
-DBT_DIR := dbt
-export DBT_PROFILES_DIR := $(DBT_DIR)
+# absoluto: as receitas fazem `cd dbt` e um caminho relativo apontaria para dbt/dbt
+export DBT_PROFILES_DIR := $(CURDIR)/dbt
 ANO ?= 2026
-# ex: make backfill ANOS="2024 2025"
 ANOS ?= 2024 2025 2026
 
 help:  ## lista os targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-up:  ## sobe o postgres
-	docker compose up -d
+up:  ## sobe o postgres e espera ficar saudável
+	docker compose up -d --wait
 
 down:  ## derruba o postgres
 	docker compose down
 
-load:  ## carrega frota + fipe no schema raw (usa a amostra por padrao)
+load:  ## carrega frota + FIPE no schema raw
 	python -m pipeline.load_frota
 	python -m pipeline.load_fipe
 
-year:  ## baixa e carrega o ano inteiro (ex: make year ANO=2026, precisa USE_SAMPLE=0)
-	python -m pipeline.download_senatran --ano $(ANO)
+dbt:  ## dbt deps + seed + run
+	cd dbt && dbt deps && dbt seed && dbt run
+
+test:  ## dbt test (dados + unitários)
+	cd dbt && dbt test
+
+pipeline: up load dbt test  ## tudo de ponta a ponta
+
+year:  ## baixa e carrega um ano (ex.: make year ANO=2026)
+	python -m pipeline.download_senatran --ano $(ANO) --parquet
 	python -m pipeline.load_frota --ano $(ANO)
 	python -m pipeline.load_fipe
 
-backfill:  ## baixa+carrega varios anos em parquet (ex: make backfill ANOS="2024 2025 2026")
-	@for ano in $(ANOS); do \
-		echo "=== $$ano ==="; \
-		python -m pipeline.download_senatran --ano $$ano --parquet || exit 1; \
-		python -m pipeline.load_frota --ano $$ano || exit 1; \
-	done
-	python -m pipeline.load_fipe
+backfill:  ## vários anos, um mês por vez no raw (ex.: make backfill ANOS="2024 2025")
+	@for ano in $(ANOS); do python -m pipeline.download_senatran --ano $$ano --parquet || exit 1; done
+	python -m pipeline.backfill --anos $(ANOS)
 
-parquet:  ## converte os TXT ja baixados de um ano em parquet via PySpark (ex: make parquet ANO=2026)
+parquet:  ## converte os TXT de um ano em Parquet (ex.: make parquet ANO=2026)
 	python -m pipeline.to_parquet_spark --ano $(ANO) --apagar-txt
 
-dbt:  ## dbt deps + seed + run
-	cd $(DBT_DIR) && dbt deps && dbt seed && dbt run
-
-test:  ## dbt test
-	cd $(DBT_DIR) && dbt test
-
-pipeline: up load dbt test  ## roda tudo de ponta a ponta
+check:  ## lint, tipos e testes python
+	ruff check . && ruff format --check . && mypy pipeline && pytest
 
 clean:  ## limpa artefatos do dbt
-	cd $(DBT_DIR) && dbt clean
+	cd dbt && dbt clean
