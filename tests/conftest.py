@@ -37,13 +37,18 @@ def spark_disponivel() -> bool:
 @pytest.fixture
 def postgres():
     """Conexão real; os testes pulam se não houver Postgres em PG*."""
-    from pipeline import db
+    import psycopg2
+
+    from pipeline import config, db
 
     try:
-        with db.conectar() as conn:
-            db.aplicar_ddl(conn)
-            yield conn
-    except Exception as e:
-        if "could not connect" in str(e) or "Connection refused" in str(e):
-            pytest.skip("sem Postgres")
-        raise
+        conn = psycopg2.connect(config.pg_dsn(), connect_timeout=3)
+    # no Windows em português a mensagem do libpq vem em latin-1 e o psycopg2
+    # estoura UnicodeDecodeError antes do OperationalError
+    except (psycopg2.OperationalError, UnicodeDecodeError):
+        pytest.skip("sem Postgres")
+    try:
+        db.aplicar_ddl(conn)
+        yield conn
+    finally:
+        conn.close()
