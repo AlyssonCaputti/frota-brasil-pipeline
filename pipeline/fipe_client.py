@@ -1,72 +1,79 @@
-"""Cliente da API FIPE (parallelum) com cache em disco.
+"""Catálogo FIPE de carros (API pública da parallelum), com cache em disco.
 
-A API e gratuita mas tem rate limit e cai as vezes, entao:
-- cacheia o catalogo inteiro num JSON (data/raw/fipe_catalogo.json);
-- se USE_SAMPLE=1, usa o catalogo que ja vem versionado em data/samples.
-
-Estrutura do catalogo:
-    { "marcas":  [ {"codigo": "1", "nome": "Acura"}, ... ],
-      "modelos": { "<marca_codigo>": [ {"codigo": 1, "nome": "Integra GS 1.8"}, ... ] } }
+Formato do catálogo:
+    {"marcas":  [{"codigo": "1", "nome": "Acura"}, ...],
+     "modelos": {"1": [{"codigo": 1, "nome": "Integra GS 1.8"}, ...]}}
 """
+
 import json
+import logging
 import time
+from collections.abc import Iterator
+from typing import Any
 
 import requests
 
 from pipeline import config
 
+log = logging.getLogger(__name__)
+
 API = "https://parallelum.com.br/fipe/api/v1/carros"
-PAUSA = 0.4  # seg entre chamadas, pra nao tomar 429
+CACHE = config.RAW_DIR / "fipe_catalogo.json"
+PAUSA = 0.4  # entre chamadas, para não tomar 429
+TENTATIVAS = 5
 
 
-def _get(url, tentativas=4):
-    for i in range(tentativas):
-        r = requests.get(url, timeout=30)
-        if r.status_code == 429:
-            espera = 2 ** i
-            print(f"  429, esperando {espera}s")
-            time.sleep(espera)
-            continue
-        r.raise_for_status()
-        return r.json()
-    raise RuntimeError(f"desisti de {url} depois de {tentativas} tentativas")
+def _get(url: str) -> Any:
+    for tentativa in range(TENTATIVAS):
+        try:
+            r = requests.get(url, timeout=30)
+            if r.status_code != 429 and r.status_code < 500:
+                r.raise_for_status()
+                return r.json()
+            motivo = f"HTTP {r.status_code}"
+        except (requests.Timeout, requests.ConnectionError) as e:
+            motivo = type(e).__name__
+        espera = 2**tentativa
+        log.warning("%s em %s, nova tentativa em %ds", motivo, url, espera)
+        time.sleep(espera)
+    raise requests.exceptions.RetryError(f"desisti de {url} depois de {TENTATIVAS} tentativas")
 
 
-def baixar_catalogo():
-    """Baixa marcas + modelos de todas as marcas. Demora (uma call por marca)."""
+def baixar_catalogo() -> dict:
     marcas = _get(f"{API}/marcas")
     modelos = {}
-    for m in marcas:
-        cod = m["codigo"]
-        print(f"  {m['nome']}...")
-        data = _get(f"{API}/marcas/{cod}/modelos")
-        modelos[cod] = data.get("modelos", data)
+    for marca in marcas:
+        dados = _get(f"{API}/marcas/{marca['codigo']}/modelos")
+        modelos[marca["codigo"]] = dados.get("modelos", dados)
         time.sleep(PAUSA)
     return {"marcas": marcas, "modelos": modelos}
 
 
-def carregar_catalogo():
-    """Retorna o catalogo, do sample ou do cache, baixando se preciso."""
+def carregar_catalogo(atualizar: bool = False) -> dict:
     if config.USE_SAMPLE:
-        path = config.SAMPLES_DIR / "fipe_catalogo.json"
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(config.AMOSTRA_FIPE.read_text(encoding="utf-8"))
 
-    cache = config.RAW_DIR / "fipe_catalogo.json"
-    if cache.exists():
-        print(f"usando cache {cache}")
-        return json.loads(cache.read_text(encoding="utf-8"))
+    if CACHE.exists() and not atualizar:
+        return json.loads(CACHE.read_text(encoding="utf-8"))
 
-    print("baixando catalogo FIPE (uma chamada por marca, vai demorar)")
-    cat = baixar_catalogo()
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(cat, ensure_ascii=False), encoding="utf-8")
-    return cat
+    log.info("baixando catálogo FIPE (uma chamada por marca)")
+    try:
+        catalogo = baixar_catalogo()
+    except requests.RequestException:
+        if not CACHE.exists():
+            raise
+        # API fora do ar não pode travar a carga do mês: sigo com o catálogo anterior
+        log.warning("FIPE indisponível, usando o cache de %s", CACHE)
+        return json.loads(CACHE.read_text(encoding="utf-8"))
+
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps(catalogo, ensure_ascii=False), encoding="utf-8")
+    return catalogo
 
 
-def iter_versoes(catalogo):
-    """Achata o catalogo em linhas (marca_cod, marca_nome, modelo_cod, modelo_nome)."""
-    nome_por_cod = {m["codigo"]: m["nome"] for m in catalogo["marcas"]}
-    for marca_cod, versoes in catalogo["modelos"].items():
-        marca_nome = nome_por_cod.get(marca_cod, "")
+def iter_versoes(catalogo: dict) -> Iterator[tuple[str, str, str, str]]:
+    """(marca_codigo, marca_nome, modelo_codigo, modelo_nome) para cada versão."""
+    nome_da_marca = {m["codigo"]: m["nome"] for m in catalogo["marcas"]}
+    for codigo, versoes in catalogo["modelos"].items():
         for v in versoes:
-            yield (marca_cod, marca_nome, str(v["codigo"]), v["nome"])
+            yield codigo, nome_da_marca.get(codigo, ""), str(v["codigo"]), v["nome"]

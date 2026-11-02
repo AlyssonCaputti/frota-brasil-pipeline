@@ -1,46 +1,42 @@
-"""Carrega o catalogo FIPE achatado em raw.fipe_versoes.
+"""Carrega o catálogo FIPE achatado em raw.fipe_versoes.
 
-Uso:
-    python -m pipeline.load_fipe
+python -m pipeline.load_fipe              # usa o cache se existir
+python -m pipeline.load_fipe --atualizar  # baixa o catálogo de novo
 """
+
+import argparse
 import csv
 import io
-import sys
+import logging
 
-import psycopg2
+from pipeline import cli, db, fipe_client
 
-from pipeline import config, fipe_client
+log = logging.getLogger(__name__)
+
+TABELA = "raw.fipe_versoes"
+COLUNAS = ("marca_codigo", "marca_nome", "modelo_codigo", "modelo_nome")
 
 
-def main():
-    catalogo = fipe_client.carregar_catalogo()
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Carrega o catálogo FIPE no schema raw")
+    ap.add_argument("--atualizar", action="store_true", help="ignora o cache e baixa de novo")
+    args = ap.parse_args(argv)
 
     buf = io.StringIO()
-    w = csv.writer(buf, delimiter="\t")
-    n = 0
-    for linha in fipe_client.iter_versoes(catalogo):
-        w.writerow(linha)
-        n += 1
+    csv.writer(buf, delimiter="\t").writerows(
+        fipe_client.iter_versoes(fipe_client.carregar_catalogo(args.atualizar))
+    )
     buf.seek(0)
 
-    conn = psycopg2.connect(config.pg_dsn())
-    try:
-        with conn.cursor() as cur:
-            cur.execute("create schema if not exists raw")
-            cur.execute("truncate table raw.fipe_versoes")
-            cur.copy_expert(
-                "COPY raw.fipe_versoes "
-                "(marca_codigo, marca_nome, modelo_codigo, modelo_nome) "
-                "FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t')",
-                buf,
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-    print(f"ok: {n:,} versoes FIPE em raw.fipe_versoes")
+    with db.conectar() as conn:
+        db.aplicar_ddl(conn)
+        with conn, conn.cursor() as cur:
+            cur.execute(f"truncate table {TABELA}")
+            db.copiar(cur, TABELA, COLUNAS, buf)
+            total = db.escalar(cur, f"select count(*) from {TABELA}")
+    log.info("%s versões em %s", f"{total:,}", TABELA)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli.executar(main)

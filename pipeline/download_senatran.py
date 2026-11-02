@@ -1,203 +1,147 @@
-"""Baixa o dump de frota por municipio do SENATRAN via CKAN.
+"""Baixa o dump de frota por município do SENATRAN (portal CKAN).
 
-O portal muda a URL do arquivo todo mes, entao a gente resolve pela API
-do CKAN em vez de hardcodar o link. O campo "name" dos resources vem
-truncado igual para todos ("Registro Nacional de Veiculos Automotores -..."),
-por isso o match sai pela url, que carrega o nome de arquivo real.
+A URL muda todo mês, então resolvo pelo package_show do CKAN, que lista todos
+os meses publicados numa chamada só. Mês que já está em disco é pulado.
 
-Uma chamada no package_show ja lista todo mes publicado, entao --ano nao
-custa request a mais - e mes ja baixado e pulado. Cada arquivo tem retry
-com backoff porque o portal corta conexao no meio do download.
-
-Uso:
-    python -m pipeline.download_senatran                # baixa o mes do .env
-    python -m pipeline.download_senatran --mes maio_2026
-    python -m pipeline.download_senatran --ano 2026     # todo mes publicado do ano
-    python -m pipeline.download_senatran --ano 2026 --parquet  # converte e apaga o TXT
+    python -m pipeline.download_senatran                   # SENATRAN_MES do .env
+    python -m pipeline.download_senatran --ultimo          # mais recente publicado
+    python -m pipeline.download_senatran --ano 2026 --parquet
 """
 
-import argparse
+import logging
 import re
-import sys
 import time
 import zipfile
+from pathlib import Path
 
 import requests
 
-from pipeline import config, to_parquet
+from pipeline import arquivos, cli, config
+from pipeline.erros import FonteNaoEncontrada, LayoutInvalido
+from pipeline.mes import NOMES, Mes
 
-# so .zip: os dumps de 2013-2018 vem em .rar, que o zipfile nao abre. o nome
-# do mes vem do proprio padrao pra ja validar e separar mes/ano.
-PADRAO_MES = re.compile(
-    r"_municipio_marca_e_modelo_ano_(" + "|".join(config.MESES) + r")_(\d{4})\.zip$"
-)
+log = logging.getLogger(__name__)
 
-# seg entre downloads. 3s era pouco: no backfill de 31 meses o portal comeca
-# a recusar depois de alguns arquivos de ~120 MB seguidos.
-PAUSA_MESES = 20
+PADRAO_URL = re.compile(rf"_municipio_marca_e_modelo_ano_(({'|'.join(NOMES)})_\d{{4}})\.zip$")
+# o portal começa a recusar depois de vários arquivos grandes seguidos
+PAUSA_ENTRE_MESES = 20
+TENTATIVAS = 6
 
 
-def meses_publicados():
-    """{"abril_2026": url} dos dumps de municipio, em ordem cronologica."""
+def meses_publicados() -> dict[Mes, str]:
     r = requests.get(
-        f"{config.CKAN_BASE}/package_show",
-        params={"id": config.CKAN_DATASET_ID},
-        timeout=60,
+        f"{config.CKAN_BASE}/package_show", params={"id": config.CKAN_DATASET_ID}, timeout=60
     )
     r.raise_for_status()
-
-    achados = []
-    for res in r.json()["result"]["resources"]:
-        m = PADRAO_MES.search(res["url"].lower())
-        if m:
-            nome, ano = m.group(1), m.group(2)
-            ordem = (int(ano), config.MESES.index(nome))
-            achados.append((ordem, f"{nome}_{ano}", res["url"]))
-    return {mes: url for _, mes, url in sorted(achados)}
+    achados = {}
+    for recurso in r.json()["result"]["resources"]:
+        if m := PADRAO_URL.search(recurso["url"].lower()):
+            achados[Mes.parse(m[1])] = recurso["url"]
+    return dict(sorted(achados.items()))
 
 
-def _stream(url, destino, ja_baixado=0):
-    cabecalhos = {"Range": f"bytes={ja_baixado}-"} if ja_baixado else {}
+def ultimo_publicado(publicados: dict[Mes, str] | None = None) -> Mes:
+    publicados = meses_publicados() if publicados is None else publicados
+    if not publicados:
+        raise FonteNaoEncontrada("o CKAN não listou nenhum dump de município")
+    return max(publicados)
+
+
+def _stream(url: str, destino: Path, offset: int) -> None:
+    cabecalhos = {"Range": f"bytes={offset}-"} if offset else {}
     with requests.get(url, stream=True, timeout=600, headers=cabecalhos) as r:
         r.raise_for_status()
-        # 206 = aceitou o Range. se vier 200 o servidor ignorou e vai mandar o
-        # arquivo inteiro, entao escreve do zero em vez de concatenar.
-        retomando = r.status_code == 206
-        total = int(r.headers.get("content-length", 0))
-        baixado = 0
-        if retomando:
-            total += ja_baixado
-            baixado = ja_baixado
-        with open(destino, "ab" if retomando else "wb") as f:
+        # 206 = retomando; 200 = o servidor ignorou o Range e manda tudo de novo
+        modo = "ab" if r.status_code == 206 else "wb"
+        with open(destino, modo) as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
                 f.write(chunk)
-                baixado += len(chunk)
-                if total:
-                    pct = 100 * baixado / total
-                    print(
-                        f"\r  {baixado / 1e6:.0f}/{total / 1e6:.0f} MB ({pct:.0f}%)",
-                        end="",
-                        flush=True,
-                    )
-        print()
-    return destino
 
 
-def baixar(url: str, destino, tentativas=6):
+def baixar(url: str, destino: Path) -> None:
+    """Baixa com retry. Da 2a tentativa em diante retoma de onde parou (Range)."""
     destino.parent.mkdir(parents=True, exist_ok=True)
-    print(f"baixando {url}")
-    for i in range(tentativas):
-        # 1a tentativa sempre do zero: parcial de uma execucao antiga pode ser
-        # de outra versao do arquivo. da 2a em diante retoma do offset ja
-        # gravado - o portal manda accept-ranges: bytes e responde 206. sem
-        # isso um arquivo de ~265 MB (2018-2019) nao fecha numa conexao que
-        # cai a cada ~100 MB: queima as tentativas reiniciando do inicio.
-        ja_baixado = destino.stat().st_size if i and destino.exists() else 0
+    log.info("baixando %s", url)
+    for tentativa in range(TENTATIVAS):
+        # a 1a sempre do zero: um parcial antigo pode ser de outra versão do arquivo
+        offset = destino.stat().st_size if tentativa and destino.exists() else 0
         try:
-            return _stream(url, destino, ja_baixado)
+            _stream(url, destino, offset)
+            return
         except requests.RequestException as e:
-            # o portal corta a conexao no meio de um arquivo de ~130MB de vez
-            # em quando (IncompleteRead).
-            #
-            # 15s dobrando: com 1/2/4/8s eu desistia de mes que estava no ar,
-            # porque o portal comeca a devolver HTTPError depois de alguns
-            # arquivos grandes seguidos e precisa de mais tempo.
-            if i == tentativas - 1:
-                break
-            espera = 15 * 2 ** i
-            tam = destino.stat().st_size if destino.exists() else 0
-            print(
-                f"\n  caiu em {type(e).__name__} com {tam / 1e6:.0f} MB, "
-                f"retomando em {espera}s"
-            )
+            if tentativa == TENTATIVAS - 1:
+                raise
+            espera = 15 * 2**tentativa
+            log.warning("%s; retomando em %ds", type(e).__name__, espera)
             time.sleep(espera)
-    raise RuntimeError(f"desisti de {url} depois de {tentativas} tentativas")
 
 
-def descompactar(zip_path):
+def descompactar(zip_path: Path) -> Path:
     with zipfile.ZipFile(zip_path) as z:
-        # de 2020 em diante o zip traz um TXT. antes disso o portal publicava
-        # banco Access (2018-2019 em .accdb, 2013-2014 em .mdb) e 2015-2017 nem
-        # zip e: extrair aquilo daria um .accdb de ~2 GB e o load reclamaria de
-        # "fonte nao encontrada" varios passos depois.
         txts = [n for n in z.namelist() if n.lower().endswith(".txt")]
         if not txts:
-            raise SystemExit(
-                f"{zip_path.name} nao tem TXT dentro: {z.namelist()}. "
-                "dumps anteriores a 2020 vem em Access (.mdb/.accdb), "
-                "formato que este pipeline nao le."
+            # antes de 2020 o portal publica Access (.mdb/.accdb) e .rar
+            raise LayoutInvalido(
+                f"{zip_path.name} não tem TXT (dumps anteriores a 2020 não são lidos)"
             )
         z.extract(txts[0], zip_path.parent)
     return zip_path.parent / txts[0]
 
 
-def main(argv=None):
-    """argv explicito porque o Airflow chama main() direto - sem isso o
-    parse_args pegaria o sys.argv do worker."""
-    ap = argparse.ArgumentParser()
-    grupo = ap.add_mutually_exclusive_group()
-    grupo.add_argument("--mes")
-    grupo.add_argument("--ano", help="baixa todo mes publicado do ano")
-    ap.add_argument(
-        "--parquet",
-        action="store_true",
-        help="converte pra parquet e apaga o TXT (use no backfill de varios "
-        "anos: ~7x menos disco)",
-    )
+def obter_mes(mes: Mes, url: str, parquet: bool) -> bool:
+    """Garante o mês em disco. Devolve True se precisou baixar."""
+    if arquivos.caminho_parquet(mes).exists():
+        log.info("%s: parquet já existe", mes)
+        return False
+
+    txt = arquivos.caminho_txt(mes)
+    baixou = not txt.exists()
+    if baixou:
+        zip_path = config.RAW_DIR / f"frota_municipio_{mes}.zip"
+        baixar(url, zip_path)
+        txt = descompactar(zip_path)
+        zip_path.unlink()
+
+    if parquet:
+        # import tardio: quem só baixa não precisa de pyspark/JVM
+        from pipeline import to_parquet_spark
+
+        to_parquet_spark.converter(txt, arquivos.caminho_parquet(mes))
+        txt.unlink()
+    return baixou
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = cli.parser_meses("Baixa o dump de frota do SENATRAN", ultimo=True)
+    ap.add_argument("--parquet", action="store_true", help="converte e apaga o TXT")
     args = ap.parse_args(argv)
 
     if config.USE_SAMPLE:
-        print(
-            "USE_SAMPLE=1 -> pulando download, usando data/samples/. "
-            "seta USE_SAMPLE=0 pra baixar o dump completo."
-        )
+        log.info("USE_SAMPLE=1: nada a baixar, a amostra está em data/samples")
         return 0
 
     publicados = meses_publicados()
-    if args.ano:
-        meses = [m for m in publicados if m.endswith(f"_{args.ano}")]
-        if not meses:
-            raise SystemExit(
-                f"nenhum mes publicado pra {args.ano}.\n"
-                "meses disponiveis:\n  - " + "\n  - ".join(publicados)
-            )
+    if args.ultimo:
+        meses = [ultimo_publicado(publicados)]
+    elif args.ano:
+        meses = [m for m in publicados if m.ano == args.ano]
     else:
-        mes = args.mes or config.SENATRAN_MES
-        if mes not in publicados:
-            raise SystemExit(
-                f"nao achei resource de municipio pro mes '{mes}'.\n"
-                "meses disponiveis:\n  - " + "\n  - ".join(publicados)
-            )
-        meses = [mes]
+        meses = args.mes or [cli.mes_padrao()]
 
-    print(f"{len(meses)} mes(es): {', '.join(meses)}")
-    baixados = 0
+    faltando = [m for m in meses if m not in publicados]
+    if faltando or not meses:
+        disponiveis = ", ".join(map(str, publicados))
+        raise FonteNaoEncontrada(
+            f"não publicado: {faltando or args.ano}. Disponíveis: {disponiveis}"
+        )
+
+    baixou_antes = False
     for mes in meses:
-        txt = config.caminho_frota(mes)
-        # parquet conta como baixado: depois de --parquet o TXT nao existe
-        # mais, e olhar so ele baixaria 130 MB de novo pra nada
-        if to_parquet.caminho_parquet(mes).exists():
-            print(f"{mes}: parquet ja existe, pulando")
-            continue
-        if txt.exists():
-            print(f"{mes}: {txt.name} ja existe, pulando")
-            continue
-        if baixados:
-            time.sleep(PAUSA_MESES)
-        zip_path = config.RAW_DIR / f"frota_municipio_{mes}.zip"
-        baixar(publicados[mes], zip_path)
-        print(f"pronto: {descompactar(zip_path)}")
-        # o zip nao serve mais - a fonte do load e o TXT (ou o parquet)
-        zip_path.unlink(missing_ok=True)
-        if args.parquet:
-            # import tardio: quem so baixa (sem --parquet) nao devia
-            # precisar de pyspark/JVM instalado so pra importar este modulo.
-            from pipeline import to_parquet_spark
-
-            to_parquet_spark.converter(mes, apagar_txt=True)
-        baixados += 1
+        if baixou_antes:
+            time.sleep(PAUSA_ENTRE_MESES)
+        baixou_antes = obter_mes(mes, publicados[mes], args.parquet)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli.executar(main)

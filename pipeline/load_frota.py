@@ -1,229 +1,114 @@
-"""Carrega o dump de frota (Parquet, TXT ou amostra) na raw.frota_municipio.
+"""Carrega a frota em raw.frota_municipio, um mês por transação.
 
-Le em streaming e usa COPY do postgres (via copy_expert) por batches -
-o arquivo full tem 22M linhas, nao da pra segurar em memoria nem fazer
-INSERT linha a linha.
+Cada mês é uma partição lógica (mes_referencia): apago o mês e insiro de novo,
+então recarregar é idempotente e os outros meses ficam intactos. Leio o
+Parquet do mês quando existe e o TXT quando não.
 
-Prefiro o Parquet do mes quando existe e caio no TXT quando nao, pra quem
-ja baixou os TXT nao ter que converter. O parquet e gerado pelo
-to_parquet_spark.py (producao) ou pelo to_parquet.py (fallback/comparacao,
-ver docs/decisions.md) - os dois escrevem no mesmo caminho
-(to_parquet.caminho_parquet), entao esse modulo nao precisa saber qual dos
-dois gerou o arquivo.
-
-Cada mes e uma particao logica por mes_referencia: o load apaga so o mes
-que esta entrando, entao recarregar um mes e idempotente e os outros meses
-ficam onde estao.
-
-Uso:
-    python -m pipeline.load_frota                   # mes do .env
+    python -m pipeline.load_frota                  # SENATRAN_MES do .env
     python -m pipeline.load_frota --mes maio_2026
-    python -m pipeline.load_frota --ano 2026        # todo mes ja baixado do ano
+    python -m pipeline.load_frota --ano 2026       # todo mês em data/raw
 """
 
-import argparse
 import csv
 import io
-import sys
+import logging
+from collections.abc import Iterable, Iterator
+from pathlib import Path
+from typing import IO
 
-import psycopg2
+import pyarrow as pa
+import pyarrow.csv as pacsv
+import pyarrow.dataset as ds
+from psycopg2.extensions import connection
 
-from pipeline import config, to_parquet
+from pipeline import arquivos, cli, config, db
+from pipeline.arquivos import COLUNAS, LeituraTxt
+from pipeline.erros import ErroPipeline, FonteNaoEncontrada, LayoutInvalido
+from pipeline.mes import Mes
 
-BATCH = 100_000
+log = logging.getLogger(__name__)
 
-# Acima desse percentual de linhas descartadas a carga aborta. Mesma ideia do
-# limite que uso no sap-mysql-etl: descarte pontual acontece, descarte em massa
-# e layout novo na origem se passando por linha ruim.
-LIMITE_DESCARTE_PCT = 0.5
+TABELA = "raw.frota_municipio"
+COLUNAS_RAW = (*COLUNAS, "mes_referencia")
+LOTE = 200_000
 
-
-def aplicar_ddl(cur):
-    ddl = (config.ROOT / "pipeline" / "sql" / "raw_ddl.sql").read_text(encoding="utf-8")
-    cur.execute(ddl)
-
-
-def copiar_batch(cur, linhas):
-    """Manda um batch via COPY. linhas = lista de tuplas ja prontas."""
-    buf = io.StringIO()
-    w = csv.writer(buf, delimiter="\t")
-    for t in linhas:
-        w.writerow(t)
-    buf.seek(0)
-    cur.copy_expert(
-        "COPY raw.frota_municipio "
-        "(uf, municipio, marca_modelo, ano_fabricacao, qtd_veiculos, mes_referencia) "
-        "FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t')",
-        buf,
-    )
+Lotes = Iterator[tuple[IO, int]]
 
 
-def meses_do_ano(ano):
-    """Meses de <ano> com Parquet ou TXT em data/raw, em ordem cronologica.
-
-    Olho os dois: depois de --apagar-txt o mes existe so em Parquet, e checar
-    apenas o TXT o deixaria fora do --ano sem reclamar.
-    """
-    meses = [f"{m}_{ano}" for m in config.MESES]
-    return [
-        m
-        for m in meses
-        if config.caminho_frota(m).exists() or to_parquet.caminho_parquet(m).exists()
-    ]
-
-
-def _ler_txt(fonte, mes, descarte):
-    """Gera as tuplas do TXT do SENATRAN.
-
-    `descarte` e dict de saida (gerador nao tem return): preencho aqui, o
-    chamador le depois. Nao rendo junto das tuplas porque num arquivo 100%
-    torto nada seria rendido e o descarte se perderia num "ok: 0 linhas".
-    """
-    with open(fonte, encoding="utf-8-sig") as f:
-        reader = csv.reader(f, delimiter=";")
-        next(reader)  # header
-        for n_linha, row in enumerate(reader, start=2):
-            if len(row) != 5:
-                # Linha torta. Antes isso era um `continue` calado: em 22M
-                # linhas, uma mudanca de layout descartava centenas de
-                # milhares e o processo ainda imprimia "ok". Agora conto,
-                # guardo exemplo e aborto se passar do limite.
-                descarte["n"] += 1
-                if len(descarte["exemplos"]) < 5:
-                    descarte["exemplos"].append(
-                        f"linha {n_linha}: {len(row)} campo(s) -> {row[:6]}"
-                    )
-                continue
-            uf, mun, mm, ano, qtd = (c.strip() for c in row)
-            yield (uf, mun, mm, ano, qtd, mes)
+def _lotes_txt(linhas: Iterable[tuple[str, ...]], mes: str) -> Lotes:
+    buf, n = io.StringIO(), 0
+    escritor = csv.writer(buf, delimiter="\t")
+    for linha in linhas:
+        escritor.writerow((*linha, mes))
+        n += 1
+        if n == LOTE:
+            buf.seek(0)
+            yield buf, n
+            buf, n = io.StringIO(), 0
+            escritor = csv.writer(buf, delimiter="\t")
+    if n:
+        buf.seek(0)
+        yield buf, n
 
 
-def _ler_parquet(fonte, mes, descarte):
-    """Gera as tuplas do Parquet, por batch.
-
-    pyarrow.dataset (nao pq.ParquetFile) de proposito: abre arquivo unico
-    (to_parquet.py) ou diretorio de part-files (to_parquet_spark.py) do
-    mesmo jeito, sem esse modulo precisar saber qual dos dois gerou o
-    arquivo. Nao toco em `descarte`: quem gerou o parquet ja contou as
-    linhas tortas e o schema garante as 5 colunas.
-    """
-    import pyarrow.dataset as ds
-
-    dataset = ds.dataset(fonte, format="parquet")
-    for lote in dataset.to_batches(batch_size=BATCH, columns=to_parquet.COLUNAS):
-        colunas = [lote.column(c).to_pylist() for c in to_parquet.COLUNAS]
-        for uf, mun, mm, ano, qtd in zip(*colunas):
-            yield (uf, mun, mm, ano, qtd, mes)
+def _lotes_parquet(caminho: Path, mes: str) -> Lotes:
+    opcoes = pacsv.WriteOptions(include_header=False, delimiter="\t")
+    for lote in ds.dataset(caminho, format="parquet").to_batches(columns=list(COLUNAS)):
+        if not lote.num_rows:
+            continue
+        tabela = pa.Table.from_batches([lote]).append_column(
+            "mes_referencia", pa.array([mes] * lote.num_rows, pa.string())
+        )
+        buf = io.BytesIO()
+        pacsv.write_csv(tabela, buf, opcoes)
+        buf.seek(0)
+        yield buf, lote.num_rows
 
 
-def _escolher_fonte(mes):
-    """(caminho, leitor) do mes: Parquet se existir, senao o TXT."""
-    parquet = to_parquet.caminho_parquet(mes)
-    # com USE_SAMPLE nem olho: a amostra e CSV e nunca gera parquet
-    if not config.USE_SAMPLE and parquet.exists():
-        return parquet, _ler_parquet
-    return config.caminho_frota(mes), _ler_txt
-
-
-def carregar_mes(cur, mes):
-    """Carrega um mes e devolve (linhas carregadas, linhas descartadas)."""
-    fonte, leitor = _escolher_fonte(mes)
+def carregar_mes(conn: connection, mes: Mes, fonte: Path) -> int:
     if not fonte.exists():
-        raise SystemExit(
-            f"fonte nao encontrada: {fonte} (rodou o download? ou seta USE_SAMPLE=1)"
-        )
+        raise FonteNaoEncontrada(f"{fonte} não existe (rodou o download_senatran?)")
+    log.info("%s: carregando %s", mes, fonte.name)
 
-    print(f"carregando {fonte.name} -> raw.frota_municipio ({mes})")
-    cur.execute("delete from raw.frota_municipio where mes_referencia = %s", (mes,))
+    leitura = None if fonte.suffix == ".parquet" else LeituraTxt(fonte)
+    lotes = _lotes_txt(leitura, str(mes)) if leitura else _lotes_parquet(fonte, str(mes))
 
-    total = 0
-    descarte = {"n": 0, "exemplos": []}
-    buffer = []
-    for tupla in leitor(fonte, mes, descarte):
-        buffer.append(tupla)
-        if len(buffer) >= BATCH:
-            copiar_batch(cur, buffer)
-            total += len(buffer)
-            print(f"\r  {total:,} linhas", end="", flush=True)
-            buffer = []
-    if buffer:
-        copiar_batch(cur, buffer)
-        total += len(buffer)
-
-    descartadas = descarte["n"]
-    exemplos_descarte = descarte["exemplos"]
-    lidas = total + descartadas
-    pct = (descartadas / lidas * 100) if lidas else 0.0
-
-    if descartadas:
-        print(
-            f"\n  ATENCAO: {descartadas:,} de {lidas:,} linha(s) "
-            f"descartada(s) ({pct:.2f}%) por numero de campos != 5"
-        )
-        for ex in exemplos_descarte:
-            print(f"    {ex}")
-
-    # Piso de 0.5%: acima disso nao e sujeira pontual da origem, e mudanca
-    # de layout. Melhor abortar e ficar com o dado do mes passado do que
-    # subir uma tabela com buraco que ninguem vai notar. Avaliado por mes:
-    # diluir no ano inteiro esconderia justamente o mes que quebrou.
-    if pct > LIMITE_DESCARTE_PCT:
-        raise ValueError(
-            f"descarte de {pct:.2f}% passou do limite de "
-            f"{LIMITE_DESCARTE_PCT}% ({descartadas:,} de {lidas:,} linhas) "
-            f"em {mes}. Abortei: isso tem cara de layout novo na origem, "
-            f"nao de linha ruim."
-        )
-    return total, descartadas
+    # `with conn` faz rollback em qualquer erro: o mês antigo só some se o novo entrar inteiro
+    with conn, conn.cursor() as cur:
+        cur.execute(f"delete from {TABELA} where mes_referencia = %s", (str(mes),))
+        total = 0
+        for buf, n in lotes:
+            db.copiar(cur, TABELA, COLUNAS_RAW, buf)
+            total += n
+        if leitura:
+            leitura.validar()
+        if not total:
+            raise LayoutInvalido(f"{fonte.name} não tem nenhuma linha válida")
+    return total
 
 
-def main(argv=None):
-    """argv explicito por causa do Airflow (ver download_senatran)."""
-    ap = argparse.ArgumentParser()
-    grupo = ap.add_mutually_exclusive_group()
-    grupo.add_argument("--mes", action="append", help="pode repetir")
-    grupo.add_argument("--ano", help="carrega todo mes do ano ja baixado")
-    args = ap.parse_args(argv)
+def main(argv: list[str] | None = None) -> int:
+    args = cli.parser_meses("Carrega a frota no schema raw").parse_args(argv)
 
-    if args.ano:
-        if config.USE_SAMPLE:
-            raise SystemExit(
-                "--ano nao combina com USE_SAMPLE=1: a amostra e de um mes so "
-                "e seria carregada varias vezes com mes_referencia diferente."
-            )
-        meses = meses_do_ano(args.ano)
+    if config.USE_SAMPLE:
+        if args.ano:
+            raise ErroPipeline("--ano não combina com USE_SAMPLE=1: a amostra é de um mês só")
+        fontes = [(m, config.AMOSTRA_FROTA) for m in args.mes or [cli.mes_padrao()]]
+    elif args.ano:
+        meses = arquivos.meses_em_disco(args.ano)
         if not meses:
-            raise SystemExit(
-                f"nenhum TXT de {args.ano} em {config.RAW_DIR}. roda o "
-                f"download_senatran --ano {args.ano} primeiro."
-            )
+            raise FonteNaoEncontrada(f"nenhum mês de {args.ano} em {config.RAW_DIR}")
+        fontes = [(m, arquivos.escolher_fonte(m)) for m in meses]
     else:
-        meses = args.mes or [config.SENATRAN_MES]
+        fontes = [(m, arquivos.escolher_fonte(m)) for m in args.mes or [cli.mes_padrao()]]
 
-    conn = psycopg2.connect(config.pg_dsn())
-    conn.autocommit = False
-    try:
-        with conn.cursor() as cur:
-            aplicar_ddl(cur)
-        conn.commit()
-
-        # uma transacao por mes: o que ja entrou fica commitado e um mes
-        # torto aborta o resto sem levar os anteriores junto.
-        for mes in meses:
-            with conn.cursor() as cur:
-                total, descartadas = carregar_mes(cur, mes)
-            conn.commit()
-            print(
-                f"\nok: {total:,} linhas em raw.frota_municipio ({mes})"
-                + (f" ({descartadas:,} descartada(s))" if descartadas else "")
-            )
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    with db.conectar() as conn:
+        db.aplicar_ddl(conn)
+        for mes, fonte in fontes:
+            total = carregar_mes(conn, mes, fonte)
+            log.info("%s: %s linhas em %s", mes, f"{total:,}", TABELA)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli.executar(main)
