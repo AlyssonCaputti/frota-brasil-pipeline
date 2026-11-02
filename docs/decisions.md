@@ -1,329 +1,113 @@
-# Scope decisions
+# Decisions
 
-Short log of the "why" behind the non-obvious choices. Written as I went, not
-rationalized after the fact.
+The why behind the choices that aren't obvious from the code.
 
-## Granularity
+## Scope
 
-Municipality level. It's the finest grain SENATRAN publishes and it doesn't cost
-anything to keep it — the marts aggregate up to national when needed.
+- **Municipality grain.** It's the finest SENATRAN publishes and costs nothing
+  to keep; the marts roll up when needed.
+- **Cars and light commercials only**, filtered by the FIPE whitelist (see
+  [pipeline.md](pipeline.md)), since the dump has no vehicle type.
+- **Partial specs, said out loud.** Power only exists when FIPE's version name
+  has "Ncv" (~48%). I ship what free sources give and document the gap.
 
-## Vehicle scope: cars + light commercials only
+## One month = one partition
 
-No motorcycles, trucks, buses or trailers. The trick to filter them without a
-vehicle-type column (the municipality dump doesn't have one) is: **keep only
-`(brand, model_base)` pairs that exist in the FIPE car catalog** (a whitelist).
-That drops motorcycles/trucks automatically — including the motorcycles of
-brands that also make cars (Honda CG/BIZ vs Honda Civic).
+Every step treats a month as the unit: the load deletes and reinserts one
+`mes_referencia`, the marts replace whole months, BigQuery partitions by month.
+Reloading a month is idempotent end to end. No index on `mes_referencia`: low
+cardinality, and it would slow `COPY` more than it helps the monthly delete.
 
-## Specs coverage is partial, on purpose
+## Raw lands as text
 
-- Engine/fuel come from the FIPE version name → good coverage.
-- Power (cv) only when the version name carries "Ncv" → ~half.
-- Wheel/tyre from a scraped source with anti-bot → partial, and the pre-1990
-  classics (Fusca, Kombi, Opala...) simply aren't cataloged anywhere free.
+Everything in `raw` is a string. Casting at load time means deciding the schema
+before looking at the data; dbt staging does it with validation instead.
 
-Decision: ship what the free sources give, be explicit about the gap in the
-docs, don't fake it.
+## The monthly DAG asks for the newest month
 
-## One month per load, or a whole year
+SENATRAN publishes with a variable lag. Deriving the month from the run date
+would either point at a month that isn't out yet or skip one. The DAG asks CKAN
+for the newest published month and passes it explicitly to download, load and
+`dbt run --vars`. A rerun redoes the same month without duplicates.
 
-`raw.frota_municipio` used to be dropped and recreated on every load, so the
-table only ever held the month in `SENATRAN_MES`. The marts already carried
-`mes_referencia` all the way through the lineage, so the only thing missing was
-the load step: it now deletes just the month being loaded and appends it. That
-makes reloading a month idempotent and lets `--ano 2026` keep 7 months side by
-side. The monthly Airflow DAG stops wiping history as a side effect.
+## Parquet as cold storage, PySpark as the converter
 
-The coverage test groups by `mes_referencia` for the same reason — averaged over
-a year, one broken month would hide behind the good ones.
+One month of TXT is ~1.1 GB; across the seven months of 2026 Parquet is
+**18x smaller** (7.80 GB → 0.43 GB), because the columns repeat a lot.
 
-Skipped an index on `mes_referencia`: it's a low-cardinality column and the
-index would cost more during `COPY` than it saves on the once-per-month
-`delete`.
-
-## Incremental marts, partitioned by month
-
-The marts used to be `materialized='table'`, so a full year rebuilt ~157M rows
-on every `dbt run` just to add one month. Three years would be ~700M. Both
-marts are now `materialized='incremental'` with `incremental_strategy='delete+insert'`
-and `unique_key='mes_referencia'`.
-
-The unique key is the **month**, not the grain (`marca+modelo_base+ano+...`).
-That's deliberate: the logical partition is the whole month, which is the same
-contract `load_frota.py` already honors when it deletes only the month being
-loaded. Reloading a month stays idempotent end to end.
-
-The month filter lives in one macro (`filtro_meses`) so both marts pick the
-same months. `mart_consolidada` compares against **itself** rather than its
-source — comparing against the source would permanently skip a month that had
-landed in `mart_frota_municipio` but not yet in the consolidated table.
-
-Two consequences worth knowing:
-
-- FIPE specs carry no month (the catalog is always "now"), so a month already
-  materialized keeps the specs that were valid when it landed. Use
-  `dbt run --full-refresh` to re-spec history against a fresh catalog.
-- To reprocess one corrected month without touching the rest:
-  `dbt run --vars '{meses: ["maio_2026"]}'`.
-
-## Parquet as the cold copy of raw
-
-One month of the dump is ~1.1 GB of TXT and ~22M rows; three years would be
-~35 GB of text sitting on disk. `pipeline/to_parquet.py` converts each month to
-Parquet (zstd + dictionary encoding), written in row groups so peak memory
-stays flat regardless of file size.
-
-The committed 75k-row sample gave 7.0x (3.98 MB → 0.57 MB), and the hunch that
-the full dump would do better was right by a wide margin: across all seven real
-months of 2026 it is **18.0x** (7.80 GB → 0.43 GB), consistently 18.0–18.1x
-month to month. `municipio` and `marca_modelo` repeat far more across 22M rows
-than across 75k, so the dictionary pays for itself several times over. Verified
-by round-trip against the TXT: same 22,126,367 rows and same fleet total of
-132,424,106 on both sides.
-
-So three years is ~1.9 GB of Parquet, not the ~5 GB the sample ratio suggested.
-
-Everything stays string-typed, exactly like `raw_ddl.sql` — casting here would
-mean deciding the schema before looking at the data, which is precisely what
-landing raw as text already avoids.
-
-`load_frota.py` prefers the Parquet when it exists and falls back to the TXT
-otherwise, so nobody who already has TXT files on disk has to convert. Parquet
-is a *cold copy*, not a replacement for Postgres: it exists so a month can be
-reprocessed without re-downloading 130 MB. (This module is no longer the one
-that produces that Parquet in production — see below.)
-
-Deliberately **not** done: moving the warehouse to DuckDB-over-Parquet. It is
-arguably the right long-term shape for 700M rows, but it swaps the engine
-(`unaccent` doesn't exist in DuckDB, the loads are psycopg2, CI would change)
-and nothing has been measured yet showing Postgres as the bottleneck.
-
-## Moving parquet conversion to PySpark
-
-`pipeline/to_parquet_spark.py` replaced `to_parquet.py` as the converter the
-Makefile and `download_senatran.py --parquet` actually call. Not because
-~700M rows (~1.9 GB of Parquet) needs Spark — that still fits in memory on
-one machine, which is exactly what `to_parquet.py` already did in constant
-memory. The volume didn't force this; it was a deliberate call to put a real,
-measured PySpark path into production rather than leave it as an unused
-line in a requirements file. `to_parquet.py` stays in the repo, unchanged and
-still tested, as the no-JVM fallback and the baseline the numbers below are
-measured against.
-
-Measured on April/2026 (22,423,952 rows), same machine, same file:
+PySpark is the production converter. Measured on April/2026 (22.4M rows):
 
 | | Time |
 |---|---|
-| `to_parquet.py` (pandas/pyarrow, single-threaded `csv.reader`) | 105.3s |
-| `to_parquet_spark.py`, `local[*]` (28 cores) | 20.2–30.4s |
-| `to_parquet_spark.py`, `local[2]` (closer to a CI/Airflow worker) | 71.6s |
+| `to_parquet.py` (pyarrow, single-threaded CSV parsing) | 105s |
+| Spark `local[*]` (28 cores) | 20–30s |
+| Spark `local[2]` | 72s |
 
-Spark wins in both cases (**3.5–5.2x** on 28 cores, **~1.5x** on 2), but not
-because "Spark is faster" — the bottleneck in `to_parquet.py` is CPU-bound,
-single-threaded, pure-Python CSV parsing, and Spark splits that work across
-whatever cores are available. On a 2-core CI runner the JVM startup cost eats
-most of the advantage; the size of the win is a property of the hardware and
-this specific bottleneck, not a general verdict.
+The win comes from parallel CSV parsing, not from Spark being magic; on two
+cores the JVM startup eats most of it. Two lessons:
 
-**A mistake worth recording, because it reversed the entire result once.**
-The first production version forced Spark to write a single file
-(`.coalesce(1)`) to match `to_parquet.py`'s layout, so `load_frota.py` and
-`download_senatran.py` wouldn't need to know which converter produced the
-Parquet. That serialized the write into one task and **cost more than Spark's
-parallel read saved** — 131.8s, slower than the 105.3s baseline it was meant
-to beat. The actual fix: keep Spark's native output (a directory of
-part-files, written in parallel) and change the *reader* instead.
-`load_frota.py`'s `_ler_parquet` now opens the source with
-`pyarrow.dataset.dataset(...)`, which reads a single file or a directory of
-part-files identically — so `to_parquet.py`'s and `to_parquet_spark.py`'s
-outputs are interchangeable without either one bending its native write
-format to imitate the other. Forcing a shared *file* layout was the wrong
-compatibility boundary; a shared *reader* was the right one.
+- Forcing one output file with `coalesce(1)` serialized the write and made Spark
+  slower than the baseline (132s). I kept Spark's directory of part-files and
+  made the reader (`pyarrow.dataset`) accept both layouts.
+- With `DROPMALFORMED`, `df.count()` doesn't parse columns, so it never drops
+  anything and reported 0 malformed rows. I now count what was actually written.
 
-Round-trip verified at each step: same 22,423,952 rows, same `133,852,588`
-fleet total (`qtd_veiculos` summed after trimming — Arrow's cast doesn't
-tolerate the `" 2.0"` leading space the raw TXT carries, unlike Python's
-`float()`), same five columns — and confirmed again after switching to the
-directory-based output by loading it through `load_frota.py` into Postgres:
-22,423,952 rows landed, same fleet total.
+Both converters write to a temporary path and swap at the end, strip values,
+and abort above 0.5% malformed rows. A broken conversion never replaces a good
+Parquet, and the limit applies whether the month comes from TXT or Parquet.
 
-Real costs accepted with this move, not hidden: a JVM dependency where there
-was none before; the job warns about exceeding 95% of default heap on a
-single month, so production heap sizing needs attention before this scales
-past one month at a time; and on Windows, Spark's Hadoop compatibility layer
-needs `HADOOP_HOME` pointing at a `winutils.exe`/`hadoop.dll` pair (fetched
-here for Hadoop 3.3.5, close enough to the bundled 3.3.4) to create temp dirs
-at all — Linux doesn't hit this, but that claim is based on how Hadoop's
-`Shell` class is documented to behave, not on having tested this repo's CI
-on Linux at the time of writing.
+`to_parquet.py` stays as the no-JVM fallback and the benchmark baseline.
 
-## Resuming downloads instead of restarting them
+## Resumable downloads
 
-A failed download used to start the file over, on the assumption that Range
-wasn't reliable here. It is: the portal sends `accept-ranges: bytes` and answers
-`206` with a correct `content-range` to a ranged GET.
+The portal accepts `Range` and answers `206`. The 265 MB months of 2018–2019
+drop every ~100 MB, so restarting from zero never finished; resuming did
+(56 → 111 → 168 → 266 MB). The first attempt always starts clean, since a stale
+partial could belong to an older version of the file.
 
-That assumption cost a whole backfill. The ~130 MB months of 2026 survive a
-restart; the ~265 MB months of 2018–2019 don't, because the connection drops
-every ~100 MB and a restart never gets further than the previous attempt —
-January/2019 burned every retry without completing once. With resume it
-finished through three consecutive drops (56 → 111 → 168 → 266 MB).
+## 2020 is the floor
 
-The first attempt still starts clean, since a partial left over from an earlier
-run could belong to a different version of the file. A corrupted concatenation
-would be caught by the zip CRC anyway, but not starting one is cheaper.
+The yearly zips hold `.mdb` (2013–14), `.rar` (2015–17) and `.accdb` (2018–19).
+I tried reading the 2 GB `.accdb` of January/2019: `access-parser` used 5.8 GB of
+RAM without finishing, and ODBC doesn't expose the GUID-named data table. The
+next attempt should be `mdb-export` from mdbtools on Linux.
 
-## How far back the backfill goes: 2020
+## Backfill one month at a time
 
-Probing the tail of each yearly zip (the central directory sits at the end, so a
-ranged GET of the last 64 KB lists the contents without downloading 250 MB):
+31 months in `raw` would be 60+ GB. `backfill.py` loads a month, runs the marts
+for that month, then removes it from `raw`. Peak disk is one month; the marts
+keep the history. That's why `mart_frota_municipio` refuses a plain
+`--full-refresh`: rebuilding it from an emptied `raw` would wipe history.
 
-| Years | Inside the zip | Readable |
-|---|---|---|
-| 2013–2014 | `.mdb` | no |
-| 2015–2017 | `.rar` archives | no |
-| 2018–2019 | `.accdb` (MS Access) | no |
-| 2020–2026 | `.TXT` | yes |
+## Cross-dialect SQL
 
-Finding this out the slow way produced a 1.95 GB `.accdb` from January/2019, so
-`descompactar` now refuses a zip with no TXT in it and says why, instead of
-letting the failure surface as "fonte nao encontrada" several steps later.
-Reading the Access years would need `mdbtools` or `access-parser` — a new
-extractor, not a tweak.
+The first real run on BigQuery failed on Postgres-only syntax: `unaccent`,
+regex flags, `~`, `regexp_match(...)[1]`, `percentile_cont ... within group`,
+`filter (where ...)`, `::numeric`. Each difference now lives in one macro with a
+branch per dialect (`macros/norm_txt.sql`). Two fixes from the audit:
 
-## The Access years (2018–2019): attempted, not shipped
+- Postgres reads `\b` as backspace, not a word boundary, so `ev\b` never matched.
+  Fuel is now matched on the normalized name (`' EV '`), same on both engines.
+- `model_base` turned HR-V, WR-V and ZR-V into "CRV". It now glues the tokens
+  back (`HR V` → `HRV`). Both cases have unit tests.
 
-The portal changed container, not content: `.TXT` from 2020, `.accdb` in
-2018–2019, `.mdb` in 2013–2014. An extractor writing a TXT in the modern shape
-would let `to_parquet`, `load_frota` and the whole dbt lineage stay ignorant of
-where the month came from. I tried to build it against January/2019 — a 2.05 GB
-`.accdb` — and stopped. Notes, so the next attempt starts further along:
+## De-para fan-out
 
-**`access-parser` (pure Python) is not viable at this file size.** Asking it for
-`Layout I`, a *metadata* table with six columns, consumed **5.8 GB of RAM and
-646 s of CPU without finishing**. It appears to materialize the whole database
-regardless of the table requested, and `parse_table` has no streaming API — it
-returns `{column: [values]}` for everything.
+`de_para_marca` has keys that collide after normalization (`M.BENZ`/`M BENZ`).
+The join duplicated those rows (23.2M out of 22.4M in `stg_frota`). It never
+reached the totals only because Mercedes-Benz doesn't pass the FIPE whitelist.
+The join now uses a `distinct` view of the seed, and a test fails if two keys
+ever collide into different brands.
 
-**`pyodbc` with the native ACE driver is the right shape and still blocked.** It
-connects in 7.3 s and reads schema cheaply, so memory and speed stop being the
-problem. What blocks it is the file itself: the data lives in
-`f_D1526399FEE243B19F3FB88B6E1000A0_Data`, a GUID-named object that ODBC does
-not return from `tables()` at all, and follow-up queries hang. Only `Layout I`
-is exposed as a real table. Whatever produced these files didn't lay them out
-like an ordinary Access database.
+## BigQuery Sandbox
 
-So the backfill floor stays **2020**, and it isn't a line of code away. The
-honest next step is `mdb-export` from mdbtools on Linux, which reads the file
-format directly rather than through the Access engine — untested here, since
-mdbtools has no Windows build and this machine has no Linux.
+Real project, no billing. Two limits: partitions older than 60 days are dropped
+(historical marts build empty) and there's no `DELETE`. The views match Postgres
+row for row, which proves the SQL; the empty marts are a free-tier limit. The
+test `assert_meses_do_raw_nos_marts` makes that visible instead of passing
+trivially.
 
-## Making the staging layer actually cross-dialect
+## Why dbt
 
-`norm_txt`/`model_base` compiled fine on Postgres and were assumed portable
-because the BigQuery target parsed and resolved partition/cluster configs
-correctly. Parsing isn't running: the first real `dbt run --target bq`
-failed on the very first two models, because the staging layer used a pile
-of Postgres-only syntax that dbt's Jinja layer never checks:
-
-- `unaccent()` — a Postgres extension function, no BigQuery equivalent at all.
-- `regexp_replace(str, pattern, repl, 'g')` — the 4th "global" flag arg;
-  BigQuery's `REGEXP_REPLACE` has no flags and already replaces every match.
-- `substring(x from position(y in x) + 1)` — ANSI syntax BigQuery doesn't
-  parse. `substr()`/`strpos()` are functions, not syntax, and exist with the
-  same signature on both engines — swapping to those needed no new macro.
-- `split_part()` raw — Postgres-only; `dbt.split_part()` is the cross-dialect
-  version already used by `mes_para_data`.
-- `!~` / `~` / `~*` (regex non-match, match, case-insensitive match) — none
-  exist on BigQuery, which uses `REGEXP_CONTAINS(str, r'...')`, with `(?i)`
-  prefixed onto the pattern for case-insensitivity.
-- `(regexp_match(str, pattern))[1]` — Postgres returns an array you index;
-  BigQuery's `REGEXP_EXTRACT` returns the captured group directly.
-- `percentile_cont(0.5) within group (order by x)` — an ordered-set aggregate
-  syntax BigQuery doesn't recognize as an aggregate at all (there it's an
-  analytic/window function, incompatible with a plain `GROUP BY`).
-  `APPROX_QUANTILES(x, 2)[OFFSET(1)]` is the closest aggregate equivalent —
-  approximate rather than exact, acceptable here since it only guards against
-  one outlier trim pulling the median.
-
-Each divergence got a `target.type == 'bigquery'` branch in a macro
-(`_sem_acento`, `_regexp_replace_g`, `_regexp_match`, `_regexp_match_i`,
-`_regexp_extract`, `_split_part`, `_depois_do_primeiro`, `_depois_do_ultimo`,
-`_mediana`), so the Postgres branch is untouched byte-for-byte and the
-BigQuery branch is what actually ran and got verified against real data.
-
-## A real bug the BigQuery run surfaced: de-para fan-out
-
-Getting the staging layer to compile was necessary but not sufficient —
-`stg_frota` still produced 23,233,938 rows against a `raw.frota_municipio`
-of exactly 22,423,952. The extra ~810k rows were a genuine, pre-existing
-duplication bug, present in Postgres too (not something the BigQuery port
-introduced): `de_para_marca` has two collisions after normalization —
-`M.BENZ`/`M BENZ` and `MERCEDES BENZ`/`MERCEDES-BENZ` both collapse to the
-same key, so the `left join` in `stg_frota` fanned out, attaching the same
-`marca_padrao` to a frota row twice.
-
-It never showed up in the headline numbers because Mercedes-Benz doesn't
-survive the FIPE whitelist join in `int_frota_carros` — the duplicate rows
-got filtered out before they could inflate `mart_frota_municipio`'s totals.
-That's luck, not correctness: the day a colliding brand *does* survive the
-whitelist, its fleet count silently doubles.
-
-Fixed at the root: `stg_frota` now joins against a `select distinct
-(normalized_key, marca_padrao)` view of the seed instead of the raw seed
-with an inline `norm_txt()` on the join condition. That collapses the two
-known collisions (they map to the same `marca_padrao`) without picking a
-side arbitrarily. `assert_de_para_marca_sem_colisao` is the safety net for
-the worse case — a normalized key mapping to *different* `marca_padrao`
-values, where `distinct` wouldn't be enough and the fan-out would come back.
-
-## Running dbt against a real BigQuery project (Sandbox, no billing)
-
-Cheap and honest way to test the BigQuery target beyond `dbt parse`: BigQuery
-Sandbox gives a real GCP project with no credit card, ~1 TB query processing
-and 10 GB storage free, permanently. `dbt run --target bq` against it, with
-`raw.frota_municipio` and `raw.fipe_versoes` loaded from the same April/2026
-data already validated on Postgres, is what caught both issues above.
-
-It also surfaced a Sandbox-specific limit worth knowing, not a pipeline bug:
-partitioned tables in Sandbox mode carry a hard 60-day partition expiration
-(`OPTIONS(partition_expiration_days=...)` does not override it — tried,
-confirmed with a 2-row synthetic repro). Our test partition value was
-`2026-04-01`; against the real server date (`CURRENT_DATE()`, verified
-directly), that's ~174 days old, well past the 60-day floor, so the
-partitioned `CREATE TABLE ... AS SELECT` runs, scans the source rows (visible
-in the job's bytes-processed stat), and writes zero rows — silently, no
-error. The same DDL with a recent partition value populates normally
-(confirmed with a synthetic single-row repro), so the partition/cluster
-logic itself is correct; it's the historical test data that Sandbox won't
-retain. Offered the choice explicitly — enable billing to remove the limit,
-or accept it and document it — the call was to accept it: stay on the free
-Sandbox and be precise about what "in production" means here rather than
-attach a real credit card to make a test pass.
-
-A third bug turned up on a later full re-run: `assert_cobertura_specs.sql`
-used `filter (where combustiveis is not null)` inside a `sum` and a
-`frota_com_spec::numeric` cast — both Postgres-only (`FILTER` on an aggregate
-isn't valid BigQuery syntax at all; `::` isn't either). Fixed the same way as
-everything else in the staging layer: `sum(case when ... then qtd_veiculos
-else 0 end)` and `dbt.type_numeric()`, portable on both engines, re-verified
-against real (non-empty) data on Postgres to confirm the fix wasn't just
-passing because the input was empty.
-
-With that fixed, `dbt test --target bq` is 13/13 — but the honest reading of
-that number matters: the mart tables are empty (the 60-day expiration above),
-so `not_null`, `accepted_range` and `unique_combination_of_columns` all pass
-**trivially** — zero rows means nothing to violate. That 13/13 is not
-evidence the marts are correct on BigQuery. What *is* evidence: `stg_frota`,
-`stg_fipe`, `int_fipe_specs` and `int_frota_carros` are views (recomputed on
-every query, so they can't be hollowed out by partition expiration the way a
-table can), and their row counts match Postgres exactly. The transform SQL is
-proven; only the final table's retention is bounded by the free tier.
-
-## Why dbt for the transforms
-
-The normalization rules (brand de-para, model_base extraction, year validation)
-were originally a pile of pandas in a `lib_normaliza.py`. Moving them into dbt
-gives version-controlled SQL, lineage and testable assumptions
-(`not_null`, `unique`, `relationships`, plus a custom coverage test).
+The normalization used to be pandas. In dbt it's versioned SQL with lineage and
+tests on the assumptions.

@@ -1,7 +1,5 @@
 # Data sources
 
-Reference month: **April 2026** (`abril_2026`).
-
 ## 1. SENATRAN — fleet count
 
 Portal: `dados.transportes.gov.br` (CKAN).
@@ -12,7 +10,8 @@ Portal: `dados.transportes.gov.br` (CKAN).
   - UTF-8, `;` separator, ~22.4M rows, 133.8M vehicles
   - columns: `UF | Município | Marca Modelo | Ano Fabricação Veículo CRV | Qtd. Veículos`
 
-To resolve the resource URL programmatically:
+The file URL changes every month, so I resolve it through CKAN
+(`package_show`), which lists every published month in one call:
 
 ```
 GET https://dados.transportes.gov.br/api/3/action/package_show?id=registro-nacional-de-veiculos-automotores-renavam
@@ -38,4 +37,4 @@ version name string (FIPE does not expose them as separate fields). ~107 brands,
 
 `jantes-e-pneus.com/size/{brand}/{model}/{year}/` — OEM wheel/tyre size.
 Has anti-bot (403/405/429 on bursts), so coverage is partial. Not part of the
-core dbt flow; kept as an optional enrichment step. See `docs/decisions.md`.
+core dbt flow.
