@@ -1,41 +1,21 @@
-{{
-  config(
-    materialized='incremental',
-    unique_key='mes_referencia',
-    incremental_strategy=(
-      'insert_overwrite' if target.type == 'bigquery' else 'delete+insert'
-    ),
-    partition_by=(
-      {'field': 'mes_data', 'data_type': 'date', 'granularity': 'month'}
-      if target.type == 'bigquery' else none
-    ),
-    cluster_by=(['marca', 'modelo_base'] if target.type == 'bigquery' else none),
-  )
-}}
+{{ config(**config_mart_mensal()) }}
 
 /*
-  Entregavel principal: frota nacional por marca/modelo_base/ano cruzada com
-  as specs da FIPE. left join na spec pra nao perder frota quando a spec falta
-  (fica null e conta como gap de cobertura - a gente mede isso no teste).
+  Frota nacional por marca / modelo_base / ano / mês com as specs da FIPE.
+  left join para não perder frota sem spec: vira null e conta como gap no teste
+  de cobertura.
 
-  Incremental por mes, igual o mart_frota_municipio (ver macro filtro_meses).
-
-  Detalhe: a FIPE nao tem mes, o catalogo e sempre o estado atual. Entao um
-  mes ja materializado conserva as specs de quando entrou - pra re-specar o
-  historico com o catalogo novo, dbt run --full-refresh.
+  A FIPE não tem mês, então um mês já materializado guarda as specs de quando
+  entrou. Para re-specar o histórico: dbt run --select mart_consolidada --full-refresh
+  (lê do mart_frota_municipio, que é protegido contra full refresh).
 */
 
 with frota_nacional as (
-    select
-        marca,
-        modelo_base,
-        ano,
-        sum(qtd_veiculos) as qtd_veiculos,
-        mes_referencia
+    select marca, modelo_base, ano, mes_referencia, sum(qtd_veiculos) as qtd_veiculos
     from {{ ref('mart_frota_municipio') }}
     where 1 = 1
         {{ filtro_meses() }}
-    group by 1, 2, 3, 5
+    group by 1, 2, 3, 4
 )
 
 select

@@ -1,0 +1,50 @@
+version: 2
+
+unit_tests:
+  - name: stg_fipe_extrai_modelo_base_e_combustivel
+    model: stg_fipe
+    given:
+      - input: source('raw', 'fipe_versoes')
+        rows:
+          - {marca_nome: "Honda", modelo_nome: "HR-V EXL 1.8 Flexone 16V"}
+          - {marca_nome: "Honda", modelo_nome: "CR-V EXL 2.0 16V Flexone"}
+          - {marca_nome: "VW - VolksWagen", modelo_nome: "T-Cross 1.0 TSI Flex"}
+          - {marca_nome: "Hyundai", modelo_nome: "HB 20 Sense 1.0 Flex"}
+          - {marca_nome: "Fiat", modelo_nome: "Grand Siena Attractive 1.4 Flex"}
+          - {marca_nome: "Hyundai", modelo_nome: "Kona EV (Elétrico)"}
+          - {marca_nome: "BMW", modelo_nome: "330e 2.0 Sport (Híbrido)"}
+          - {marca_nome: "GM - Chevrolet", modelo_nome: "Chevette 1.6 Álcool"}
+          - {marca_nome: "VW - VolksWagen", modelo_nome: "Amarok 2.0 132cv TDI Diesel"}
+          - {marca_nome: "Ford", modelo_nome: "Del Rey 1.6 Gasolina"}
+    expect:
+      rows:
+        - {marca_fipe: "HONDA",      modelo_base: "HRV",         combustivel: "Flex"}
+        - {marca_fipe: "HONDA",      modelo_base: "CRV",         combustivel: "Flex"}
+        - {marca_fipe: "VOLKSWAGEN", modelo_base: "TCROSS",      combustivel: "Flex"}
+        - {marca_fipe: "HYUNDAI",    modelo_base: "HB20",        combustivel: "Flex"}
+        - {marca_fipe: "FIAT",       modelo_base: "GRAND SIENA", combustivel: "Flex"}
+        - {marca_fipe: "HYUNDAI",    modelo_base: "KONA",        combustivel: "Eletrico"}
+        - {marca_fipe: "BMW",        modelo_base: "330E",        combustivel: "Hibrido"}
+        - {marca_fipe: "CHEVROLET",  modelo_base: "CHEVETTE",    combustivel: "Alcool"}
+        - {marca_fipe: "VOLKSWAGEN", modelo_base: "AMAROK",      combustivel: "Diesel"}
+        - {marca_fipe: "FORD",       modelo_base: "DEL",         combustivel: "Gasolina"}
+
+  - name: stg_frota_resolve_marca_importado_e_ano
+    model: stg_frota
+    given:
+      - input: source('raw', 'frota_municipio')
+        rows:
+          - {marca_modelo: "I/TOYOTA COROLLA XEI", ano_fabricacao: "2015", qtd_veiculos: " 7.0", mes_referencia: "abril_2026"}
+          - {marca_modelo: "VW/GOL 1.0", ano_fabricacao: "2010", qtd_veiculos: " 2.0", mes_referencia: "abril_2026"}
+          - {marca_modelo: "M.BENZ/C 180", ano_fabricacao: "Sem Informação", qtd_veiculos: " 1.0", mes_referencia: "abril_2026"}
+      - input: ref('de_para_marca')
+        rows:
+          - {marca_bruta: "TOYOTA", marca_padrao: "TOYOTA"}
+          - {marca_bruta: "VW", marca_padrao: "VOLKSWAGEN"}
+          - {marca_bruta: "M.BENZ", marca_padrao: "MERCEDES-BENZ"}
+          - {marca_bruta: "M BENZ", marca_padrao: "MERCEDES-BENZ"}
+    expect:
+      rows:
+        - {marca_padrao: "TOYOTA",        modelo_base: "COROLLA", ano: 2015, qtd_veiculos: 7}
+        - {marca_padrao: "VOLKSWAGEN",    modelo_base: "GOL",     ano: 2010, qtd_veiculos: 2}
+        - {marca_padrao: "MERCEDES-BENZ", modelo_base: "C",       ano: null, qtd_veiculos: 1}

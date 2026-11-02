@@ -1,26 +1,11 @@
-{{
-  config(
-    materialized='incremental',
-    unique_key='mes_referencia',
-    incremental_strategy=(
-      'insert_overwrite' if target.type == 'bigquery' else 'delete+insert'
-    ),
-    partition_by=(
-      {'field': 'mes_data', 'data_type': 'date', 'granularity': 'month'}
-      if target.type == 'bigquery' else none
-    ),
-    cluster_by=(['marca', 'modelo_base'] if target.type == 'bigquery' else none),
-  )
-}}
+-- Protegido contra full refresh: guarda o histórico, e o raw pode já ter sido
+-- limpo pelo backfill. Ver config_mart_mensal.
+{{ config(**config_mart_mensal(protegido=true)) }}
 
--- Frota de carros no grao mais fino: marca / modelo_base / ano / uf / municipio.
--- Este e o entregavel "Planilha 1" da versao antiga, agora como tabela.
---
--- Incremental por mes: 3 anos sao ~700M linhas, reconstruir tudo pra somar um
--- mes nao se paga. unique_key no mes, nao no grao - ver macro filtro_meses.
+-- Frota de carros no grão mais fino: marca / modelo_base / ano / UF / município / mês.
 
 select
-    marca_padrao    as marca,
+    marca_padrao      as marca,
     modelo_base,
     ano,
     uf,
