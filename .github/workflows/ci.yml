@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  dbt:
+  pipeline:
     runs-on: ubuntu-latest
 
     services:
@@ -30,58 +30,34 @@ jobs:
       PGDATABASE: frota
       PGUSER: frota
       PGPASSWORD: frota
-      # absoluto de proposito: o step de deps+parse muda pra working-directory
-      # dbt, e um caminho relativo aqui resolveria contra esse cwd (dbt/dbt),
-      # nao contra a raiz do checkout.
-      DBT_PROFILES_DIR: ${{ github.workspace }}/dbt
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          # dbt-core 1.8 nao roda no 3.13+, entao trava no 3.11
-          python-version: "3.11"
+          python-version: "3.11"  # dbt-core 1.8 não roda no 3.13
+          cache: pip
 
       - uses: actions/setup-java@v4
         with:
-          # pyspark 3.5 roda em 8/11/17 - 17 e o LTS atual, sem motivo pra
-          # travar numa versao mais velha so no CI (o Windows de dev usa 8).
           distribution: temurin
           java-version: "17"
 
-      - name: install deps
-        run: |
-          pip install -r requirements.txt
-          pip install -r requirements-pyspark.txt
+      - name: dependências
+        run: pip install -r requirements.txt -r requirements-pyspark.txt -r requirements-bigquery.txt -r requirements-dev.txt
 
-      - name: smoke test - conversao parquet via pyspark
+      - name: lint, tipos e testes python (inclui o conversor Spark)
+        run: make check
+
+      - name: pipeline na amostra (load + dbt run + dbt test com unitários)
         env:
           USE_SAMPLE: "1"
-        run: |
-          python -m pipeline.to_parquet_spark --mes abril_2026
-          python -c "
-          import pyarrow.dataset as ds
-          n = ds.dataset('data/raw/frota_municipio_abril_2026.parquet', format='parquet').count_rows()
-          assert n == 75000, f'esperava 75000 linhas na amostra, veio {n}'
-          print('smoke test ok:', n, 'linhas')
-          "
+        run: make load dbt test
 
-      - name: dbt deps + parse
+      - name: target BigQuery compila
         working-directory: dbt
-        run: |
-          dbt deps
-          dbt parse
-
-      # roda o pipeline completo na amostra e valida com dbt test.
-      # so o schema raw precisa dos loads em python antes do dbt.
-      - name: load sample + build + test
         env:
-          USE_SAMPLE: "1"
-        run: |
-          python -m pipeline.load_frota
-          python -m pipeline.load_fipe
-          cd dbt
-          dbt seed
-          dbt run
-          dbt test
+          GCP_PROJECT: ci-parse
+          DBT_PROFILES_DIR: ${{ github.workspace }}/dbt
+        run: dbt parse --target bq

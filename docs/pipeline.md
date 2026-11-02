@@ -1,43 +1,73 @@
 # Pipeline internals
 
+## Code map
+
+| Module | Job |
+|---|---|
+| `pipeline/mes.py` | `Mes`, the reference month (`abril_2026`), ordered chronologically |
+| `pipeline/arquivos.py` | where each month's files live, TXT reader, malformed-row limit |
+| `pipeline/download_senatran.py` | CKAN lookup, resumable download, `--ultimo` |
+| `pipeline/to_parquet_spark.py` | TXT → Parquet (production); `to_parquet.py` is the no-JVM fallback |
+| `pipeline/load_frota.py` / `load_fipe.py` | `COPY` into the Postgres `raw` schema |
+| `pipeline/load_bq.py` | same contract, into BigQuery |
+| `pipeline/backfill.py` | many years, one month in `raw` at a time |
+| `pipeline/dimensiona_bq.py` | BigQuery cost per query, measured on the Parquet |
+
+Expected failures (missing file, broken layout) raise `ErroPipeline`; the CLI
+prints the message and exits 1. Anything else is a bug and keeps its traceback.
+
 ## dbt lineage
 
 ```
-source: raw.frota_municipio ─> stg_frota ──────────────┐
-source: raw.fipe_versoes ────> stg_fipe ─> int_fipe_specs ┤
-                                                        ├─> int_frota_carros ─> mart_frota_municipio ─> mart_consolidada
-                              seed: de_para_marca ──────┘
+raw.frota_municipio ─> stg_frota ──────────────────┐
+raw.fipe_versoes ───> stg_fipe ─> int_fipe_specs ──┼─> int_frota_carros ─> mart_frota_municipio ─> mart_consolidada
+seed de_para_marca ─────────────────────────────────┘
 ```
 
-## The normalization rules (why they exist)
+## Normalization
 
-The SENATRAN `Marca Modelo` field is messy free text entered at registration:
+SENATRAN's `Marca Modelo` is free text typed at registration:
 
-- `VW/GOL`, `VOLKS/GOL`, `VOLKSWAGEN/GOL` — same car, three spellings.
-- `I/TOYOTA COROLLA` — the `I/` prefix means "imported"; the real brand is the
-  next token, not `I`.
-- `GM/S10`, `CHEV/S10` — GM is Chevrolet in FIPE.
-- `M.BENZ`, `MBENZ`, `M BENZ` — all Mercedes-Benz.
+- `VW/GOL`, `VOLKS/GOL`, `VOLKSWAGEN/GOL`: one car, three spellings → seed `de_para_marca`.
+- `I/TOYOTA COROLLA`: `I/` means imported; the brand is the next token.
+- `HR-V`, `T-Cross`: normalization splits them (`HR V`), `model_base` glues them back (`HRV`).
+- `CITY Sedan EX 1.5 Flex` → `CITY`, the join key with FIPE.
 
-`stg_frota` handles all of these: split on the first `/`, detect the import
-prefix, then map the brand through the `de_para_marca` seed. `model_base`
-reduces `CITY Sedan EX 1.5 Flex` to `CITY` so it joins to FIPE on a stable key.
+FIPE has no engine/fuel/power fields, so `stg_fipe` parses the version name.
+Fuel is matched on the unaccented name, so `(Elétrico)` and `(Híbrido)` count.
 
-## The car filter (whitelist)
+## Car filter
 
-The municipality dump has no vehicle-type column. Instead of maintaining a
-blocklist of motorcycle/truck models, `int_frota_carros` keeps only the
-`(brand, model_base)` pairs that exist in the FIPE **car** catalog
-(`int_fipe_specs`). Everything else — motorcycles, trucks, buses, trailers —
-drops out automatically, including the motorcycles of brands that also make
-cars (Honda CG stays out, Honda Civic stays in).
+The dump has no vehicle type. `int_frota_carros` keeps only the
+`(brand, model_base)` pairs that exist in FIPE's **car** catalog: motorcycles,
+trucks and buses drop out, including motorcycles from carmakers (Honda CG out,
+Honda Civic in).
+
+## Incremental marts
+
+Both marts are incremental by month (`unique_key = mes_referencia`). Which
+months a run touches:
+
+| Run | Months |
+|---|---|
+| `dbt run --vars '{meses: ["maio_2026"]}'` | exactly those (the DAG and backfill use this) |
+| `dbt run` | months not yet in the mart |
+| first run | all |
+
+`mart_frota_municipio` holds the history and ignores `--full-refresh` unless
+you also pass `--vars '{rebuild_historico: true}'`, because after a backfill
+`raw` no longer has the old months. To re-spec history against a new FIPE
+catalog, refresh only the consolidated mart:
+`dbt run --select mart_consolidada --full-refresh`.
 
 ## Tests
 
-- Schema tests on the marts (`not_null`, unique combination, ranges). The unique
-  combination includes `mes_referencia`, since the same brand/model/year repeats
-  once per loaded month.
-- `tests/assert_cobertura_specs.sql`: a business check that fails if the
-  fleet-weighted fuel coverage in `mart_consolidada` drops below 70% — an early
-  warning that the de-para or `model_base` stopped matching FIPE. Evaluated per
-  `mes_referencia`, so one bad month can't hide behind a good year.
+- **Unit tests** (`models/staging/_staging.yml`): `model_base` and fuel parsing
+  on fixed inputs (HR-V, T-Cross, `(Elétrico)`...). No data needed.
+- **Schema tests** on the marts: not null, ranges, unique grain.
+- `assert_meses_do_raw_nos_marts`: every month in `raw` reached the marts.
+  Catches an empty mart and a month the incremental skipped.
+- `assert_cobertura_specs`: fleet-weighted fuel coverage ≥ 70%, per month.
+- `assert_de_para_marca_sem_colisao`: seed keys can't collide into different brands.
+- **pytest** (`tests/`): file lookup, both converters on the same fixture,
+  idempotent load with rollback, retries, BigQuery loader with a fake client.

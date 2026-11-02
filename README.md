@@ -2,54 +2,42 @@
 
 ![ci](https://github.com/AlyssonCaputti/frota-brasil-pipeline/actions/workflows/ci.yml/badge.svg)
 
-Data pipeline that joins Brazil's registered vehicle fleet (SENATRAN) with
-technical specs from FIPE, to answer, per **brand / model / year**:
+I cross Brazil's registered vehicle fleet (SENATRAN) with FIPE's technical
+catalog to answer, per **brand / model / year / municipality / month**: how many
+cars are on the road, and with which engine, fuel and power.
 
-- how many vehicles are on the road (fleet count, down to municipality level);
-- engine, fuel, power and (partially) wheel/tyre size.
+Cars and light commercials only. Every source is free and public.
 
-Scope: passenger cars + light commercials only. All sources are free
-(SENATRAN open data + public FIPE API). No paid data.
-
-## Architecture
+## How it works
 
 ```
-SENATRAN dump (CKAN) ──┐
-                       ├─> raw (postgres) ─┬─> stg_frota ─┐
-FIPE API ──────────────┘                   └─> stg_fipe ──┤
-                                                          ├─> int_frota_carros ─> mart_frota_municipio
-                                            int_fipe_specs┘                    └─> mart_consolidada
+SENATRAN (CKAN) ─> download ─> Parquet (PySpark) ─┐
+FIPE API ──────────────────────────────────────────┤
+                                                    ├─> raw (Postgres or BigQuery)
+                                                    └─> dbt: staging ─> intermediate ─> marts
+Airflow, monthly: latest published month ─> load ─> dbt run (that month) ─> dbt test
 ```
 
-| Layer | Tech | What it does |
+| Layer | What I use | Notes |
 |---|---|---|
-| Extraction | Python | Resolve + download the SENATRAN dump (CKAN API), pull the FIPE catalog, load both into the `raw` schema (`COPY`, batched) |
-| Storage | PostgreSQL 16 | Landing (`raw`) + dbt-built schemas, via Docker Compose |
-| Transform | dbt (postgres) | `staging -> intermediate -> marts`, normalization as macros, brand de-para as a seed |
-| Tests | dbt tests | `not_null` / `unique` / `accepted_range` + a custom fleet-weighted coverage test |
-| Orchestration | Airflow | Monthly DAG: download -> load -> dbt run -> dbt test |
-| Warehouse migration | BigQuery | Monthly partitioning + clustering by brand/model ([docs/bigquery.md](docs/bigquery.md)) |
+| Extract | Python + requests | Resolves the month's URL through the CKAN API, resumes broken downloads |
+| Cold storage | PySpark → Parquet | 18x smaller than the TXT; aborts if more than 0.5% of rows are malformed |
+| Load | `COPY` into Postgres / load jobs into BigQuery | One month per transaction, reloading is idempotent |
+| Transform | dbt 1.8 | Same SQL on Postgres and BigQuery; dialect differences live in macros |
+| Quality | dbt tests + unit tests, pytest, ruff, mypy | All of it runs in CI |
+| Schedule | Airflow | Fixed day each month, picks the newest month SENATRAN has published |
 
-## Quickstart (sample data, no 1.2 GB download)
+## Run it
+
+With the sample (75k rows, no download):
 
 ```bash
-cp .env.example .env            # USE_SAMPLE=1 is the default
-
-python -m venv .venv && . .venv/bin/activate
+cp .env.example .env               # USE_SAMPLE=1
 pip install -r requirements.txt
-
-docker compose up -d            # postgres on :5432
-
-python -m pipeline.explore_senatran   # sanity-check the sample
-python -m pipeline.load_frota         # -> raw.frota_municipio
-python -m pipeline.load_fipe          # -> raw.fipe_versoes
-
-cd dbt
-export DBT_PROFILES_DIR=$PWD
-dbt deps && dbt seed && dbt run && dbt test
+make pipeline                       # postgres + load + dbt run + dbt test
 ```
 
-Query the result:
+Then:
 
 ```sql
 select marca, modelo_base, ano, qtd_veiculos, combustiveis, potencia_cv_mediana
@@ -58,108 +46,53 @@ order by qtd_veiculos desc
 limit 20;
 ```
 
-Or just use the Makefile:
+With real data, set `USE_SAMPLE=0` and:
 
 ```bash
-make up          # postgres
-make pipeline    # load + dbt run + dbt test, end to end
-make help        # list targets
+pip install -r requirements-pyspark.txt              # needs Java 8/11/17
+python -m pipeline.download_senatran --ultimo --parquet
+python -m pipeline.load_frota --mes julho_2026
+python -m pipeline.load_fipe --atualizar
+make dbt test
 ```
 
-To run against the **full** dataset instead of the sample: set `USE_SAMPLE=0`
-in `.env` and run `python -m pipeline.download_senatran` first (~128 MB zip,
-~1.14 GB extracted, ~22M rows).
+`make help` lists everything: a full year (`make year ANO=2026`), several years
+without filling the disk (`make backfill ANOS="2024 2025"`), lint and tests
+(`make check`).
 
-Each month is a logical partition keyed by `mes_referencia`, and a load only
-replaces the month it is loading — so months accumulate and reloading one is
-idempotent. The marts are incremental on the same key, so adding a month
-doesn't rebuild the ones already there. To pull a whole year (2026 currently
-publishes January–July, ~940 MB zipped / ~8 GB extracted / ~157M rows):
+## Monthly schedule
 
-```bash
-python -m pipeline.download_senatran --ano 2026   # every month published
-python -m pipeline.load_frota --ano 2026          # every month downloaded
-# or: make year ANO=2026
-```
+The DAG runs on a fixed day (`FROTA_CRON`, default `0 6 15 * *`, the 15th at
+06:00). SENATRAN publishes with a variable lag, so I don't guess the month from
+the date: I ask CKAN for the newest one, download it, load it and run dbt for
+that month only. If it was already loaded, everything is redone without
+duplicates. Details in [airflow/README.md](airflow/README.md).
 
-### Multi-year backfill
+## Numbers (April/2026, full dump)
 
-For several years, keep the raw months as Parquet instead of TXT — measured
-**18x smaller** across the seven real months of 2026 (7.80 GB → 0.43 GB), since
-the dump's columns are almost all low-cardinality:
-
-```bash
-make backfill ANOS="2024 2025 2026"     # download → parquet → load, year by year
-make parquet ANO=2026                   # convert TXTs already on disk
-```
-
-`load_frota` reads the Parquet when it's there and the TXT when it isn't, so
-converting is optional. Rough sizing per year of TXT vs. Parquet:
-
-| | Months | TXT on disk | Parquet | Raw rows |
-|---|---|---|---|---|
-| 2026 so far | 7 | 7.8 GB | **0.43 GB** | 156,907,285 |
-| 3 full years | ~31 | ~35 GB | ~1.9 GB | ~700M |
-
-2026 is measured, the three-year row is that ratio extrapolated. **2020 is as
-far back as this goes**: the portal publishes 2018–2019 as Microsoft Access
-(`.accdb`), 2013–2014 as `.mdb` and 2015–2017 as `.rar`, none of which are read
-here — asking for an older year fails with a message saying so.
-
-Two flags worth knowing:
-
-```bash
-# reprocess one corrected month without touching the rest
-cd dbt && dbt run --vars '{meses: ["maio_2026"]}'
-
-# FIPE specs have no month, so a materialized month keeps the specs it
-# landed with; re-spec all history against a fresh catalog:
-cd dbt && dbt run --full-refresh
-```
-
-## Results (full April/2026 dataset)
-
-| Metric | Value |
+| | |
 |---|---|
-| Total vehicles in the raw dump | 133.8M |
-| Classified as car / light commercial | 77.2M |
-| Coverage vs. official light-vehicle total (82.9M) | **93.1%** |
-| Fuel / engine spec coverage (fleet-weighted) | 86.2% |
-| Power (cv) coverage | 48.0% (only when FIPE version name carries "Ncv") |
-| Wheel / tyre coverage | 81.9% (optional enrichment step) |
+| Rows in the dump | 22.4M (133.8M vehicles) |
+| Classified as car / light commercial | 77.1M vehicles, 93.0% of the official total |
+| Fuel / engine coverage, fleet-weighted | 86.3% |
+| Power coverage | 48% (FIPE only has it when the version name says "Ncv") |
+| TXT → Parquet, 7 months of 2026 | 7.80 GB → 0.43 GB |
 
-The ~6.9% coverage gap is brands/models whose SENATRAN spelling didn't match
-FIPE, candidates for extending the de-para seed.
+## Limits I know about
 
-> On the small committed sample the car share looks lower (~30%) because a
-> single sampled row weighs the same whether it's a mass-market car or a
-> one-off motorcycle; the 93.1% is on the full, volume-weighted fleet.
+- **Power at 48%.** It only exists inside FIPE's free-text version name.
+- **`modelo_base` is a heuristic**: the first canonical token of the model name.
+  Good for fleet counts, not for trim-level detail.
+- **2020 is the floor.** Earlier years come as Access/RAR files I don't read.
+- **BigQuery Sandbox** expires partitions after 60 days and has no `DELETE`, so
+  historical months only stick on a billed project.
 
-## Known limitations
+## Docs
 
-- **Power at 48%.** FIPE only exposes power inside the free-text version name,
-  and only for some versions. A better source would be needed to close this.
-- **Wheel/tyre is partial and not in the core dbt flow.** The only free source
-  has anti-bot and doesn't catalog pre-1990 classics (Fusca, Kombi, Opala...).
-  Kept as an optional step, not a hard dependency of the marts.
-- **`model_base` is a heuristic.** First canonical token of the model name.
-  It works for the vast majority but merges some distinct trims; good enough for
-  fleet-level aggregation, not for VIN-level precision.
+- [docs/pipeline.md](docs/pipeline.md): lineage, normalization rules, tests
+- [docs/decisions.md](docs/decisions.md): the why behind the non-obvious choices
+- [docs/bigquery.md](docs/bigquery.md): partitioning, clustering and what it costs
+- [docs/sources.md](docs/sources.md): where the data comes from
 
-## BigQuery: monthly partitioning + clustering
-
-The marts carry `partition_by` (monthly, on a derived `mes_data`) and
-`cluster_by` (`marca`, `modelo_base`), applied when `target.type` is `bigquery`
-so the Postgres path is untouched. Partition and cluster keys were sized from
-the real dump with `python -m pipeline.dimensiona_bq`: a month-filtered query
-reads 97% fewer bytes, clustering cuts the worst brand query from 20.3 GB to
-3.0 GB, and behind a dashboard at 1,000 queries/day that is US$ 96/month
-instead of US$ 3,457/month. Full reasoning and caveats in
-[docs/bigquery.md](docs/bigquery.md).
-
-See [docs/sources.md](docs/sources.md) and [docs/decisions.md](docs/decisions.md).
-
-## License
-
-MIT, see [LICENSE](LICENSE). SENATRAN and FIPE data belong to their
-respective sources; this repo only ships a small sample for demonstration.
+MIT license. SENATRAN and FIPE data belong to their sources; the repo only ships
+a small sample.

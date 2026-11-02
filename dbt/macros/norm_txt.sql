@@ -1,13 +1,8 @@
 {#
-  Normalizacao de texto - equivalente SQL do norm_txt() que era em python:
-  caixa alta, remove acentos, troca -./ por espaco, tira o resto que nao
-  for A-Z0-9, colapsa espacos.
-
-  Multi-dialeto: Postgres usa unaccent (create extension unaccent) e
-  regexp_replace com flag 'g'. BigQuery nao tem unaccent nem flag de regex
-  (regexp_replace la ja substitui tudo por padrao) - o equivalente e
-  normalize(str, NFD) + regexp_replace tirando os marks combinantes (\p{Mn}).
+  Normalização de texto e as poucas funções que mudam entre Postgres e BigQuery.
+  Cada divergência fica numa macro com um ramo por dialeto; o resto do SQL é comum.
 #}
+
 {% macro _sem_acento(col) %}
   {%- if target.type == 'bigquery' -%}
     regexp_replace(normalize(upper({{ col }}), NFD), r'\p{Mn}', '')
@@ -16,30 +11,15 @@
   {%- endif -%}
 {% endmacro %}
 
+{# substitui todas as ocorrências; aceita \1 no replacement nos dois dialetos #}
 {% macro _regexp_replace_g(col, pattern, replacement) %}
   {%- if target.type == 'bigquery' -%}
-    regexp_replace({{ col }}, '{{ pattern }}', '{{ replacement }}')
+    regexp_replace({{ col }}, r'{{ pattern }}', r'{{ replacement }}')
   {%- else -%}
     regexp_replace({{ col }}, '{{ pattern }}', '{{ replacement }}', 'g')
   {%- endif -%}
 {% endmacro %}
 
-{#
-  !~ do Postgres (regex nao-match) vira NOT REGEXP_CONTAINS no BigQuery.
-  Usado em model_base pra saber se o 2o token comeca com digito.
-#}
-{% macro _nao_comeca_com_digito(col) %}
-  {%- if target.type == 'bigquery' -%}
-    not regexp_contains({{ col }}, r'^[0-9]')
-  {%- else -%}
-    {{ col }} !~ '^[0-9]'
-  {%- endif -%}
-{% endmacro %}
-
-{#
-  ~ do Postgres (regex match) vira REGEXP_CONTAINS no BigQuery.
-  Usado na validacao de ano em stg_frota.
-#}
 {% macro _regexp_match(col, pattern) %}
   {%- if target.type == 'bigquery' -%}
     regexp_contains({{ col }}, r'{{ pattern }}')
@@ -48,60 +28,29 @@
   {%- endif -%}
 {% endmacro %}
 
-{#
-  split_part cru e Postgres-only; BigQuery nao tem. dbt.split_part e
-  cross-dialect mas exige o delimitador como literal SQL entre aspas.
-#}
+{# 1o grupo capturado #}
+{% macro _regexp_extract(col, pattern, case_insensitive=false) %}
+  {%- if target.type == 'bigquery' -%}
+    regexp_extract({{ col }}, r'{{ "(?i)" if case_insensitive }}{{ pattern }}')
+  {%- else -%}
+    (regexp_match({{ col }}, '{{ pattern }}'{{ ", 'i'" if case_insensitive }}))[1]
+  {%- endif -%}
+{% endmacro %}
+
 {% macro _split_part(col, delim, n) %}
   {{ dbt.split_part(col, "'" ~ delim ~ "'", n) }}
 {% endmacro %}
 
-{#
-  substring(x from position(y in x) + 1) e sintaxe ANSI que o BigQuery nao
-  aceita. substr()/strpos() sao funcoes (nao sintaxe) e existem nos dois
-  dialetos com a mesma assinatura.
-#}
-{% macro _depois_do_primeiro(col, sep) %}
-  substr({{ col }}, strpos({{ col }}, '{{ sep }}') + 1)
-{% endmacro %}
-
-{#
-  Tudo depois da ULTIMA ocorrencia de sep, ou a coluna inteira se sep nao
-  aparece. Usado pra tirar o prefixo de sigla da FIPE ("GM - Chevrolet").
-  split_part(col, sep, -1) e uma extensao so do Postgres.
-#}
-{% macro _depois_do_ultimo(col, sep) %}
+{# tudo depois da 1a ocorrência de sep, ou a coluna inteira se sep não aparece #}
+{% macro _depois_de(col, sep) %}
   case
     when strpos({{ col }}, '{{ sep }}') > 0
-    then substr({{ col }}, strpos({{ col }}, '{{ sep }}') + {{ sep|length }})
+    then substr({{ col }}, strpos({{ col }}, '{{ sep }}') + {{ sep | length }})
     else {{ col }}
   end
 {% endmacro %}
 
-{#
-  1o grupo capturado de uma regex. Postgres devolve array ((...)[1]);
-  BigQuery ja devolve o grupo direto com regexp_extract.
-#}
-{% macro _regexp_extract(col, pattern, case_insensitive=false) %}
-  {%- set pat = ('(?i)' ~ pattern) if (case_insensitive and target.type == 'bigquery') else pattern -%}
-  {%- if target.type == 'bigquery' -%}
-    regexp_extract({{ col }}, r'{{ pat }}')
-  {%- else -%}
-    (regexp_match({{ col }}, '{{ pattern }}'{{ ", 'i'" if case_insensitive else "" }}))[1]
-  {%- endif -%}
-{% endmacro %}
-
-{#
-  ~* do Postgres (regex match case-insensitive) vira REGEXP_CONTAINS com
-  (?i) no BigQuery.
-#}
-{#
-  Mediana agregada com GROUP BY. Postgres tem percentile_cont(0.5) within
-  group (order by x), sintaxe que o BigQuery nem reconhece (la percentile_cont
-  so existe como window function via OVER()). approx_quantiles(x, 2)[offset(1)]
-  e o equivalente aproximado - aceitavel aqui, e so pra evitar que uma versao
-  esportiva isolada puxe a potencia_cv_mediana.
-#}
+{# mediana em agregação com GROUP BY; no BigQuery só existe aproximada #}
 {% macro _mediana(col) %}
   {%- if target.type == 'bigquery' -%}
     approx_quantiles({{ col }}, 2)[offset(1)]
@@ -110,41 +59,36 @@
   {%- endif -%}
 {% endmacro %}
 
-{% macro _regexp_match_i(col, pattern) %}
-  {%- if target.type == 'bigquery' -%}
-    regexp_contains({{ col }}, r'(?i){{ pattern }}')
-  {%- else -%}
-    {{ col }} ~* '{{ pattern }}'
-  {%- endif -%}
-{% endmacro %}
-
+{# caixa alta, sem acento, só A-Z0-9 separados por um espaço #}
 {% macro norm_txt(col) %}
-  {{ _regexp_replace_g(
-    _regexp_replace_g(_sem_acento(col), '[^A-Z0-9]+', ' '),
-    '^ +| +$', ''
-  ) }}
+  {{ _regexp_replace_g(_regexp_replace_g(_sem_acento(col), '[^A-Z0-9]+', ' '), '^ +| +$', '') }}
 {% endmacro %}
 
-
+{#
+  Modelo-base: 1o token do nome normalizado, a chave do join SENATRAN x FIPE.
+  Junta nomes que a normalização separa (HR-V -> HRV, T-Cross -> TCROSS) e
+  mantém dois tokens nos prefixos compostos (GRAND SIENA, NEW CIVIC).
+#}
 {% macro model_base(col) %}
-  {#
-    modelo-base: 1o token canonico do modelo, com as correcoes de nome
-    composto (CR-V -> CRV etc) que fazem o match SENATRAN<->FIPE bater.
-    prefixos compostos (GRAND SIENA, NEW CIVIC) mantem 2 tokens.
-  #}
-  {% set corrigido %}
-    {{ _regexp_replace_g(
-      _regexp_replace_g(norm_txt(col), 'CR V|HR V|WR V|ZR V', 'CRV'),
-      'T CROSS|HB 20', 'TCROSS'
-    ) }}
-  {% endset %}
-  {% set primeiro_token = dbt.split_part(corrigido, "' '", 1) %}
-  {% set segundo_token = dbt.split_part(corrigido, "' '", 2) %}
+  {%- set junto -%}
+    {{ _regexp_replace_g(_regexp_replace_g(_regexp_replace_g(
+         norm_txt(col),
+         '([CHWZ]R) V', '\\1V'),
+         'T CROSS', 'TCROSS'),
+         'HB 20', 'HB20') }}
+  {%- endset -%}
+  {%- set primeiro = dbt.split_part(junto, "' '", 1) -%}
+  {%- set segundo = dbt.split_part(junto, "' '", 2) -%}
   case
-    when {{ primeiro_token }} in ('GRAND', 'NEW', 'GREAT', 'PT')
-     and {{ _nao_comeca_com_digito(segundo_token) }}
-     and length({{ segundo_token }}) > 2
-    then {{ primeiro_token }} || ' ' || {{ segundo_token }}
-    else {{ primeiro_token }}
+    when {{ primeiro }} in ('GRAND', 'NEW', 'GREAT', 'PT')
+     and not {{ _regexp_match(segundo, '^[0-9]') }}
+     and length({{ segundo }}) > 2
+    then {{ primeiro }} || ' ' || {{ segundo }}
+    else {{ primeiro }}
   end
+{% endmacro %}
+
+{# teto do ano de fabricação, com um ano de folga; sobrescreva com --vars '{ano_max: 2030}' #}
+{% macro ano_max() %}
+  {{- var('ano_max', modules.datetime.date.today().year + 1) -}}
 {% endmacro %}

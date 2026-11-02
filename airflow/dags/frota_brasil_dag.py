@@ -1,89 +1,79 @@
-"""DAG mensal da frota Brasil.
+"""DAG mensal: pega o mês mais recente que o SENATRAN publicou e atualiza os marts.
 
-Orquestra: download SENATRAN -> load frota -> load FIPE -> dbt (deps/seed/
-run/test). O download e os loads sao PythonOperator chamando o pacote
-pipeline; o dbt roda via BashOperator (jeito mais simples sem o astronomer
-cosmos, que seria overkill pra 1 projeto).
-
-Schedule mensal porque o SENATRAN publica o dump uma vez por mes. catchup
-desligado - nao adianta reprocessar meses velhos que nao estao no portal.
+Roda num dia fixo (FROTA_CRON, padrão dia 15 às 06h). O SENATRAN publica com
+atraso variável, então não deduzo o mês pela data: pergunto ao CKAN qual é o
+último publicado. Se ele já estava carregado, a carga é refeita (idempotente)
+e o dbt reprocessa só aquele mês.
 """
+
 import os
 from datetime import datetime, timedelta
 
-from airflow import DAG
+from airflow.decorators import dag, task
 from airflow.operators.bash import BashOperator
-from airflow.operators.python import PythonOperator
 
-# raiz do projeto (o repo montado no container). ajusta se preciso.
 PROJECT_ROOT = os.getenv("PROJECT_ROOT", "/opt/frota-brasil-pipeline")
-DBT_DIR = os.path.join(PROJECT_ROOT, "dbt")
-
-default_args = {
-    "owner": "alysson",
-    "retries": 2,
-    "retry_delay": timedelta(minutes=5),
-    "depends_on_past": False,
-}
+DBT_DIR = f"{PROJECT_ROOT}/dbt"
+MES = "{{ ti.xcom_pull(task_ids='ultimo_mes') }}"
 
 
-# passo argv sempre: com argv=None o parse_args pegaria o sys.argv do worker.
-def _download(**_):
-    from pipeline.download_senatran import main
-    # --parquet porque a DAG roda todo mes: sem isso o volume acumula ~8 GB
-    # de TXT por ano.
-    main(["--parquet"])
+def _dbt(task_id: str, comando: str) -> BashOperator:
+    return BashOperator(
+        task_id=task_id,
+        bash_command=f"cd {DBT_DIR} && {comando}",
+        env={"DBT_PROFILES_DIR": DBT_DIR},
+        append_env=True,
+    )
 
 
-def _load_frota(**_):
-    from pipeline.load_frota import main
-    main([])
-
-
-def _load_fipe(**_):
-    from pipeline.load_fipe import main
-    main()
-
-
-with DAG(
-    dag_id="frota_brasil",
-    description="Consolida frota SENATRAN x specs FIPE, mensal",
-    default_args=default_args,
-    schedule="@monthly",
-    start_date=datetime(2026, 6, 1),
+@dag(
+    schedule=os.getenv("FROTA_CRON", "0 6 15 * *"),
+    start_date=datetime(2026, 1, 1),
     catchup=False,
+    default_args={"owner": "frota", "retries": 2, "retry_delay": timedelta(minutes=10)},
     tags=["frota", "senatran", "dbt"],
-) as dag:
+)
+def frota_brasil():
+    @task
+    def ultimo_mes() -> str:
+        from pipeline.download_senatran import ultimo_publicado
 
-    download = PythonOperator(task_id="download_senatran", python_callable=_download)
-    load_frota = PythonOperator(task_id="load_frota_raw", python_callable=_load_frota)
-    load_fipe = PythonOperator(task_id="load_fipe_raw", python_callable=_load_fipe)
+        return str(ultimo_publicado())
 
-    dbt_env = {"DBT_PROFILES_DIR": DBT_DIR, **os.environ}
+    @task
+    def preparar_banco() -> None:
+        from pipeline import db
 
-    # deps so precisa rodar quando muda packages.yml, mas roda rapido, deixo sempre
-    dbt_deps = BashOperator(
-        task_id="dbt_deps",
-        bash_command=f"cd {DBT_DIR} && dbt deps",
-        env=dbt_env,
-    )
-    dbt_seed = BashOperator(
-        task_id="dbt_seed",
-        bash_command=f"cd {DBT_DIR} && dbt seed",
-        env=dbt_env,
-    )
-    dbt_run = BashOperator(
-        task_id="dbt_run",
-        bash_command=f"cd {DBT_DIR} && dbt run",
-        env=dbt_env,
-    )
-    dbt_test = BashOperator(
-        task_id="dbt_test",
-        bash_command=f"cd {DBT_DIR} && dbt test",
-        env=dbt_env,
-    )
+        with db.conectar() as conn:
+            db.aplicar_ddl(conn)
 
-    # frota e fipe podem carregar em paralelo, mas os dois tem que terminar
-    # antes do dbt (o dbt run precisa das duas tabelas raw).
-    download >> load_frota
-    [load_frota, load_fipe] >> dbt_deps >> dbt_seed >> dbt_run >> dbt_test
+    @task
+    def baixar(mes: str) -> None:
+        from pipeline.download_senatran import main
+
+        main(["--mes", mes, "--parquet"])
+
+    @task
+    def carregar_frota(mes: str) -> None:
+        from pipeline.load_frota import main
+
+        main(["--mes", mes])
+
+    @task
+    def carregar_fipe() -> None:
+        from pipeline.load_fipe import main
+
+        main(["--atualizar"])
+
+    mes = ultimo_mes()
+    banco = preparar_banco()
+    frota = carregar_frota(mes)
+    fipe = carregar_fipe()
+    banco >> [frota, fipe]
+    baixar(mes) >> frota
+
+    dbt_run = _dbt("dbt_run", f"dbt deps && dbt seed && dbt run --vars '{{meses: [\"{MES}\"]}}'")
+    [frota, fipe] >> dbt_run >> _dbt("dbt_test", "dbt test")
+
+
+frota_brasil()

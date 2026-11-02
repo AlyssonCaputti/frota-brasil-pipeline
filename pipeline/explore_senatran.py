@@ -1,64 +1,48 @@
-"""Exploracao rapida do dump SENATRAN: encoding, separador, colunas,
-contagem de linhas e amostra. Roda contra a amostra por padrao.
+"""Olhada rápida no dump antes de carregar: colunas, linhas, UFs e anos estranhos.
 
-Foi o primeiro script que escrevi olhando o arquivo - deixei aqui porque
-serve de sanity-check antes de carregar (dump muda de layout de vez em quando).
+python -m pipeline.explore_senatran --mes abril_2026
 """
+
 import argparse
 import csv
-import sys
 from collections import Counter
 
-from pipeline import config
+from pipeline import arquivos, cli, config
+from pipeline.erros import FonteNaoEncontrada
+from pipeline.mes import Mes
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--mes", default=config.SENATRAN_MES)
-    args = ap.parse_args()
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Resumo do TXT da frota")
+    ap.add_argument("--mes", type=Mes.parse, default=cli.mes_padrao())
+    args = ap.parse_args(argv)
 
-    fonte = config.caminho_frota(args.mes)
+    fonte = config.AMOSTRA_FROTA if config.USE_SAMPLE else arquivos.caminho_txt(args.mes)
     if not fonte.exists():
-        raise SystemExit(f"fonte nao encontrada: {fonte}")
+        raise FonteNaoEncontrada(f"{fonte} não existe")
 
-    print(f"fonte: {fonte}")
-    print(f"tamanho: {fonte.stat().st_size / 1e6:.1f} MB")
-
-    # utf-8-sig: o dump vem com BOM no comeco do header
-    with open(fonte, encoding="utf-8-sig") as f:
-        reader = csv.reader(f, delimiter=";")
-        header = next(reader)
-        print(f"colunas ({len(header)}): {header}")
-
-        n = 0
-        ufs = Counter()
-        anos_estranhos = Counter()
-        amostra = []
-        for row in reader:
-            n += 1
-            if len(row) != len(header):
+    with open(fonte, encoding="utf-8-sig", newline="") as f:
+        leitor = csv.reader(f, delimiter=";")
+        cabecalho = next(leitor)
+        linhas, tortas = 0, 0
+        ufs: Counter[str] = Counter()
+        anos_estranhos: Counter[str] = Counter()
+        for linha in leitor:
+            linhas += 1
+            if len(linha) != len(cabecalho):
+                tortas += 1
                 continue
-            ufs[row[0]] += 1
-            ano = row[3].strip()
-            if not ano.isdigit():
-                anos_estranhos[ano] += 1
-            if len(amostra) < 5:
-                amostra.append(row)
+            ufs[linha[0]] += 1
+            if not linha[3].strip().isdigit():
+                anos_estranhos[linha[3].strip()] += 1
 
-    print(f"linhas de dados: {n:,}")
-    print(f"UFs distintas: {len(ufs)}")
-    print("top 5 UFs por linhas:")
-    for uf, c in ufs.most_common(5):
-        print(f"  {uf}: {c:,}")
+    print(f"{fonte.name}: {fonte.stat().st_size / 1e6:.1f} MB, {linhas:,} linhas, {tortas} tortas")
+    print(f"colunas: {cabecalho}")
+    print(f"{len(ufs)} UFs; maiores: {ufs.most_common(5)}")
     if anos_estranhos:
-        print("valores de ano nao-numericos (vao ser descartados no staging):")
-        for v, c in anos_estranhos.most_common():
-            print(f"  {v!r}: {c}")
-    print("amostra:")
-    for row in amostra:
-        print(f"  {row}")
+        print(f"anos não numéricos (viram null no staging): {anos_estranhos.most_common()}")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli.executar(main)
